@@ -1,6 +1,7 @@
 import {
   apiVersion,
   App,
+  Notice,
   PluginManifest,
   TFile,
 } from "obsidian";
@@ -49,17 +50,23 @@ import {
   SearchJsonResponseItem,
 } from "./types";
 import {
+  timingSafeEqualStrings,
 } from "./utils";
 import {
   getCertificateStandardsIssue,
   getCertificateValidityDays,
 } from "./certificates";
 import {
+  AUTH_FAILURE_DELAY_STEP_MS,
+  AUTH_FAILURE_DELAY_THRESHOLD,
+  AUTH_FAILURE_MAX_DELAY_MS,
+  AUTH_FAILURE_WINDOW_MS,
   CERT_NAME,
   ContentTypes,
   ERROR_CODE_MESSAGES,
   MCP_SESSIONLESS_PROTOCOL_VERSION,
   MaximumRequestSize,
+  REQUEST_TIMEOUT_MS,
 } from "./constants";
 import {
   isContentType,
@@ -200,14 +207,59 @@ export default class RequestHandler {
   }
 
   requestIsAuthenticated(req: express.Request): boolean {
-    const authorizationHeader = req.get(
-      this.settings.authorizationHeaderName ?? "Authorization",
+    const authorizationHeader =
+      req.get(this.settings.authorizationHeaderName ?? "Authorization") ?? "";
+    return timingSafeEqualStrings(
+      authorizationHeader,
+      `Bearer ${this.settings.apiKey ?? ""}`,
     );
-    if (authorizationHeader === `Bearer ${this.settings.apiKey}`) {
-      return true;
-    }
+  }
 
-    return false;
+  /** Timestamps (ms) of recent failed authentication attempts, across every
+   *  route and every client — see the doc comment on the AUTH_FAILURE_*
+   *  constants for why this is a shared budget rather than per-source. */
+  private recentAuthFailures: number[] = [];
+
+  /**
+   * Records one failed authentication attempt and returns how long the
+   * caller should wait before responding to it: 0 until the recent-failure
+   * count exceeds the threshold, then an amount that grows with how far over
+   * it the server currently is, capped at AUTH_FAILURE_MAX_DELAY_MS so this
+   * can never become an unbounded lockout (which would itself be a
+   * denial-of-service an attacker could trigger against legitimate clients).
+   */
+  private recordAuthFailureAndGetDelayMs(req: express.Request): number {
+    const now = Date.now();
+    this.recentAuthFailures = this.recentAuthFailures.filter(
+      (t) => now - t < AUTH_FAILURE_WINDOW_MS,
+    );
+    const countBeforeThisFailure = this.recentAuthFailures.length;
+    this.recentAuthFailures.push(now);
+    const count = this.recentAuthFailures.length;
+    if (count <= AUTH_FAILURE_DELAY_THRESHOLD) return 0;
+
+    const message =
+      `${count} failed authentication attempts in the last ${
+        AUTH_FAILURE_WINDOW_MS / 1000
+      }s (latest from ${req.socket.remoteAddress ?? "unknown"}). Slowing ` +
+      "responses -- this does not block requests, since the source of a " +
+      "request isn't something this server can trust. If you didn't " +
+      "expect this, check who has your API key.";
+
+    if (this.settings.enableVerboseLogging) {
+      console.warn(`[REST API] ${message}`);
+    }
+    // A console warning is easy to miss unless verbose logging is already on
+    // and the dev console is open. Surfacing this as a Notice too makes a
+    // sustained run of bad-key requests visible without either -- but only
+    // on the transition into the throttled state, not on every subsequent
+    // failure in the same burst, so an ongoing run of bad requests produces
+    // one Notice, not a stream of them.
+    if (countBeforeThisFailure <= AUTH_FAILURE_DELAY_THRESHOLD) {
+      new Notice(`Local REST API: ${message}`);
+    }
+    const over = count - AUTH_FAILURE_DELAY_THRESHOLD;
+    return Math.min(over * AUTH_FAILURE_DELAY_STEP_MS, AUTH_FAILURE_MAX_DELAY_MS);
   }
 
   async authenticationMiddleware(
@@ -225,6 +277,10 @@ export default class RequestHandler {
       !authenticationExemptRoutes.includes(req.path) &&
       !this.requestIsAuthenticated(req)
     ) {
+      const delayMs = this.recordAuthFailureAndGetDelayMs(req);
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
       this.returnCannedResponse(res, {
         errorCode: ErrorCode.ApiKeyAuthorizationRequired,
       });
@@ -1884,7 +1940,22 @@ export default class RequestHandler {
     return this._vaultCopy(filePath, req, res);
   }
 
-  redirectToVaultPath(
+  /**
+   * Delegates an `/active/` request to the corresponding `/vault/<path>`
+   * handler once the active file is known, tagging the response with the
+   * resolved path first.
+   *
+   * `handler` must be returned, not fired-and-forgotten (a bare call
+   * discards its promise, and with it any rejection — the request would
+   * then hang forever, since the same failure a `/vault/` request routes to
+   * `errorHandler` via the `handle()` wrapper would here just vanish as an
+   * unhandled rejection with no response ever sent). Returning it lets this
+   * function's own promise adopt the handler's, so `handle()`'s `.catch(next)`
+   * still sees a failure that occurs inside it. This exact shape
+   * (`void this._vaultPut(...)`) previously caused unresponsive `/active/`
+   * requests whenever the underlying write threw.
+   */
+  async redirectToVaultPath(
     file: TFile,
     req: express.Request,
     res: express.Response,
@@ -1892,8 +1963,8 @@ export default class RequestHandler {
       path: string,
       req: express.Request,
       res: express.Response,
-    ) => void,
-  ): void {
+    ) => Promise<void>,
+  ): Promise<void> {
     const path = file.path;
     res.set("Content-Location", encodeURI(path));
 
@@ -1969,7 +2040,7 @@ export default class RequestHandler {
         { createTargetIfMissing: true, source: "header" },
       );
     }
-    return this.redirectToVaultPath(file, req, res, (p, rq, rs) => { void this._vaultPut(p, rq, rs); });
+    return this.redirectToVaultPath(file, req, res, (p, rq, rs) => this._vaultPut(p, rq, rs));
   }
 
   async activeFilePost(
@@ -2021,7 +2092,7 @@ export default class RequestHandler {
         { source: "header" },
       );
     }
-    return this.redirectToVaultPath(file, req, res, (p, rq, rs) => { void this._vaultPost(p, rq, rs); });
+    return this.redirectToVaultPath(file, req, res, (p, rq, rs) => this._vaultPost(p, rq, rs));
   }
 
   async activeFilePatch(
@@ -2053,7 +2124,7 @@ export default class RequestHandler {
       file,
       req,
       res,
-      (p, rq, rs) => { void this._vaultPatch(p, rq, rs); },
+      (p, rq, rs) => this._vaultPatch(p, rq, rs),
     );
   }
 
@@ -2080,7 +2151,7 @@ export default class RequestHandler {
       file,
       req,
       res,
-      (p, rq, rs) => { void this._vaultDelete(p, rq, rs); },
+      (p, rq, rs) => this._vaultDelete(p, rq, rs),
     );
   }
 
@@ -2090,6 +2161,10 @@ export default class RequestHandler {
 
   async commandGet(_req: express.Request, res: express.Response): Promise<void> {
     res.json({ commands: this.operations.listCommands() });
+  }
+
+  async vaultInfoGet(_req: express.Request, res: express.Response): Promise<void> {
+    res.json(this.operations.getVaultInfo());
   }
 
   async commandPost(
@@ -2246,6 +2321,14 @@ export default class RequestHandler {
     } else {
       console.error("No stack available!");
     }
+    // A response can already be underway if `handle()`'s request timeout
+    // fired first: the original handler is still free to keep running (it
+    // cannot be cancelled -- see REQUEST_TIMEOUT_MS's doc comment), and if it
+    // later fails, its rejection still arrives here. Trying to send a second
+    // response for the same request throws ERR_HTTP_HEADERS_SENT, which
+    // would itself go uncaught this deep in the error-handling chain -- the
+    // exact class of bug this whole timeout mechanism exists to stop.
+    if (res.headersSent) return;
     if (err instanceof SyntaxError) {
       this.returnCannedResponse(res, {
         errorCode: ErrorCode.InvalidContentForContentType,
@@ -2259,11 +2342,111 @@ export default class RequestHandler {
     return;
   }
 
+  /**
+   * Wraps a REST route handler so a request can never wait past
+   * `timeoutMs` for a response, whatever the handler itself is doing.
+   *
+   * This exists because the two bugs fixed alongside it (`void`-discarded
+   * promises in `redirectToVaultPath`'s callers, and the servers' missing
+   * `error` listeners) share a root cause worth stating plainly: nothing in
+   * this codebase previously bounded how long a request could wait. Each of
+   * those was a specific place a promise could go unanswered; this is the
+   * backstop for every place like them that hasn't been found yet -- and for
+   * the one failure mode neither of those fixes can touch: an `await` on
+   * something that genuinely never settles (a stuck vault write behind a
+   * cloud-sync client's lock, say), as opposed to one that eventually throws.
+   *
+   * What this can and cannot do: it can stop the *client* from waiting
+   * forever, by answering 503 once `timeoutMs` elapses with no response yet.
+   * It cannot cancel the handler itself -- Obsidian's vault API has no
+   * cancellation story, so `fn(req, res)` keeps running in the background
+   * regardless. If it later succeeds, its response is silently discarded
+   * (headers are already sent); if it later fails, `errorHandler`'s own
+   * `res.headersSent` guard discards that too. Nor does it help at all if
+   * something has synchronously blocked the JS event loop rather than
+   * merely awaiting a slow promise -- a timer callback needs the event loop
+   * free to run, same as everything else. A genuinely blocked event loop
+   * freezes all of Obsidian, not just this API, which is a far rarer and
+   * more visible failure than the async hangs this guards against.
+   *
+   * One wrinkle in "if it later succeeds, its response is silently
+   * discarded": for a normal handler, the very last thing a successful run
+   * does *is* write that response (`res.json(...)` or similar) -- so the
+   * discard isn't silent from the handler's own point of view. Writing to a
+   * response whose headers are already sent throws (Node's
+   * ERR_HTTP_HEADERS_SENT), which turns what was actually a success into a
+   * *rejected* promise here, indistinguishable by shape from a real failure.
+   * The late-rejection branch below checks for exactly that error and logs
+   * it as a late completion rather than a late failure, so a real bug (the
+   * operation itself throwing) isn't reported the same way as an operation
+   * that simply finished too late to matter.
+   */
   private handle(
     fn: (req: express.Request, res: express.Response) => Promise<void>,
+    timeoutMs: number = REQUEST_TIMEOUT_MS,
   ): (req: express.Request, res: express.Response, next: express.NextFunction) => void {
     return (req, res, next) => {
-      fn(req, res).catch(next);
+      let settled = false;
+
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        if (!res.headersSent) {
+          this.returnCannedResponse(res, {
+            statusCode: 503,
+            message:
+              `This request took longer than ${timeoutMs / 1000}s and was ` +
+              "abandoned so the connection would not hang indefinitely. The " +
+              "underlying operation may still complete in the background.",
+          });
+        }
+      }, timeoutMs);
+      // Doesn't itself keep the process alive if everything else has
+      // finished -- there is nothing left this timer could usefully do then.
+      timer.unref?.();
+
+      fn(req, res).then(
+        () => {
+          if (settled) {
+            // The 503 already went out, but the handler finished on its own
+            // right after -- worth recording precisely because it's the one
+            // fact this function can state without guessing why the request
+            // was slow: the operation was not stuck, just slower than
+            // timeoutMs on this occasion.
+            if (this.settings.enableVerboseLogging) {
+              console.debug(
+                `[REST API] ${req.method} ${req.url} completed after its response had already timed out.`,
+              );
+            }
+            return;
+          }
+          settled = true;
+          clearTimeout(timer);
+        },
+        (err: unknown) => {
+          if (settled) {
+            if (this.settings.enableVerboseLogging) {
+              // A late handler's own attempt to write its (now pointless)
+              // response is what actually throws here, not the handler's
+              // real work -- reaching that write means the operation itself
+              // completed. See handle()'s doc comment for the full story.
+              const collidedWithOwnDiscardedResponse =
+                err instanceof Error &&
+                err.message.includes("Cannot set headers after they are sent");
+              console.debug(
+                collidedWithOwnDiscardedResponse
+                  ? `[REST API] ${req.method} ${req.url} completed after its response had already timed out.`
+                  : `[REST API] ${req.method} ${req.url} failed after its response had already timed out:`,
+                ...(collidedWithOwnDiscardedResponse ? [] : [err]),
+              );
+            }
+            return;
+          }
+          settled = true;
+          clearTimeout(timer);
+          next(err);
+        },
+      );
     };
   }
 
@@ -2283,8 +2466,12 @@ export default class RequestHandler {
 
     const mcpRouter = express.Router();
     mcpRouter.use(cors(corsOptions));
-    mcpRouter.use((req, res, next) => {
+    mcpRouter.use(async (req, res, next) => {
       if (!this.requestIsAuthenticated(req)) {
+        const delayMs = this.recordAuthFailureAndGetDelayMs(req);
+        if (delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
         this.returnCannedResponse(res, {
           errorCode: ErrorCode.ApiKeyAuthorizationRequired,
         });
@@ -2389,6 +2576,8 @@ export default class RequestHandler {
       });
 
     this.api.route("/tags/").get(this.handle((rq, rs) => this.tagsGet(rq, rs)));
+
+    this.api.route("/vault-info/").get(this.handle((rq, rs) => this.vaultInfoGet(rq, rs)));
 
     this.api.route("/commands/").get(this.handle((rq, rs) => this.commandGet(rq, rs)));
     this.api.route("/commands/:commandId/").post(this.handle((rq, rs) => this.commandPost(rq, rs)));

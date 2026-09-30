@@ -869,6 +869,16 @@ export class McpHandler {
     );
 
     this.tool(
+      "vault_info",
+      dedent`Return information about the vault itself: its configured display name (the value to use as the vault= parameter when building an obsidian:// URI, e.g. obsidian://open?vault=<name>&file=<path> — the vault-relative paths this API otherwise deals in are not enough on their own to build a link that opens in the Obsidian app) and, on desktop, the vault's absolute filesystem base path.`,
+      {},
+      READ_ONLY_ANNOTATIONS,
+      async () => {
+        return this.text(this.ops.getVaultInfo());
+      },
+    );
+
+    this.tool(
       "search_query",
       dedent`
         Search vault files using a JsonLogic query evaluated against each note's metadata.

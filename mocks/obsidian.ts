@@ -66,6 +66,18 @@ class DataAdapter {
   }
 }
 
+/** Mock of the desktop-only adapter subclass that exposes a real filesystem
+ *  base path. A plain `DataAdapter` is not an instance of this, so
+ *  `instanceof FileSystemAdapter` checks in production code default to false
+ *  in tests unless a test explicitly assigns one of these to `vault.adapter`. */
+export class FileSystemAdapter extends DataAdapter {
+  _basePath = "/mock/vault/path";
+
+  getBasePath(): string {
+    return this._basePath;
+  }
+}
+
 export class Vault {
   _getAbstractFileByPath: TFile | null = new TFile();
   _read = "";
@@ -74,8 +86,13 @@ export class Vault {
   _markdownFiles: TFile[] = [];
   _create: [string, string] | undefined;
   _createdFolders: string[] = [];
+  _name = "test-vault";
 
   adapter = new DataAdapter();
+
+  getName(): string {
+    return this._name;
+  }
 
   async read(file: TFile): Promise<string> {
     return this._read;
@@ -317,6 +334,29 @@ export class PluginManifest {
 }
 
 export class SettingTab {}
+
+// Real Notice pops up a UI toast; this mock just records what was shown, so
+// tests can assert on it without a DOM. `instances` is a plain mutable array
+// rather than a jest.fn(), matching the _prepareSimpleSearchMock pattern
+// below -- tests reset it themselves (`Notice.instances = []`) since a fresh
+// RequestHandler/App per test doesn't imply a fresh Notice history.
+export class Notice {
+  static instances: Notice[] = [];
+
+  message: string;
+
+  constructor(message: string, _timeout?: number) {
+    this.message = message;
+    Notice.instances.push(this);
+  }
+
+  setMessage(message: string): this {
+    this.message = message;
+    return this;
+  }
+
+  hide(): void {}
+}
 
 export const apiVersion = "1.0.0";
 

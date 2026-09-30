@@ -1,5 +1,17 @@
 # Agent Instructions
 
+## Environment Limitations
+
+This repo is frequently edited from a sandboxed environment that reaches it only through a mounted, iCloud-synced copy. That mount is unreliable independent of anything in the code: `npm install`, `npm test`, and even plain filesystem commands (`ls`, `cd`) intermittently fail with stale locks, a missing/unresolved `jest` binary, or flat permission-denied errors that come and go within the same session.
+
+When a verification step -- running tests, building, installing, anything that needs a real command to actually execute and produce real output -- cannot be completed because the sandbox has no working handle to the repository, say so plainly and hand the exact command to the user to run themselves. Do not:
+
+- Guess at or imply a result ("this should pass", "that would work") without having actually run it and seen the output.
+- Retry the same or slightly-varied command more than once or twice after the failure is clearly an access/environment problem rather than a transient blip -- diagnose it, state it, move on.
+- Silently fall back to reasoning about what the code "should" do as a substitute for running it, and present that reasoning as if it were a completed check.
+
+This applies to any action that requires a real handle the sandbox may not have -- not just tests: building, committing, pushing, or anything else that only means something if it actually ran.
+
 ## Commit Process
 
 ### Commit cadence

@@ -13,7 +13,24 @@ export const LEAF_VALIDITY_DAYS = 365;
  */
 export const LEAF_RENEWAL_WINDOW_DAYS = 30;
 
-const DEFAULT_KEY_SIZE = 2048;
+/**
+ * RSA modulus size for both the generated CA and the leaf it issues.
+ *
+ * 2048 bits (112-bit security) is still the current CA/Browser Forum
+ * baseline minimum for a publicly-trusted leaf certificate, but NIST SP
+ * 800-131A Rev. 2 targets it for deprecation by 2030 and recommends 128-bit
+ * security (~3072-bit RSA) for anything that needs to remain valid past
+ * that date. The generated CA here is exactly that case: CA_VALIDITY_DAYS
+ * is 3650 (10 years), so a CA minted today is still in service in 2036,
+ * squarely past the deprecation date -- unlike the leaf, which is
+ * re-issued from the CA well before then (LEAF_VALIDITY_DAYS / the
+ * renewal window), so it never actually depends on outliving 2030 itself.
+ * Both are generated at the same size regardless: keeping the leaf no
+ * weaker than the CA that signs it is standard practice, and the cost
+ * (a slower one-off keygen, at most a few hundred ms with node-forge) is
+ * negligible for something that happens once and then roughly annually.
+ */
+const DEFAULT_KEY_SIZE = 3072;
 const CA_COMMON_NAME = "Obsidian Local REST API CA";
 const LEAF_COMMON_NAME = "Obsidian Local REST API";
 

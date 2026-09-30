@@ -42,6 +42,7 @@ export {
 } from "./publicApi";
 import { PluginManifest } from "obsidian";
 import { configureHttpServerTimeouts } from "./serverTimeouts";
+import { closeServer, describeServerError } from "./serverLifecycle";
 
 export default class LocalRestApi extends Plugin {
   declare settings: LocalRestApiSettings;
@@ -128,54 +129,94 @@ export default class LocalRestApi extends Plugin {
     };
   }
 
-  _refreshServerState() {
-    if (this.secureServer) {
-      this.secureServer.closeAllConnections();
-      this.secureServer.close();
-      this.secureServer = null;
-    }
-    if ((this.settings.enableSecureServer ?? true) && this.settings.crypto) {
-      this.secureServer = https.createServer(
-        {
-          key: this.settings.crypto.privateKey,
-          cert: buildServerCertificateChain(this.settings.crypto),
-        },
-        this.requestHandler.api
-      );
-      configureHttpServerTimeouts(this.secureServer);
-      this.secureServer.listen(
-        this.settings.port,
-        this.settings.bindingHost ?? DefaultBindingHost
-      );
+  /**
+   * Reports a server that failed to bind (wrong port already in use,
+   * insufficient privilege for the port, unparseable certificate material,
+   * etc.). Node's `net`/`http`/`https` servers emit `error` as a plain
+   * EventEmitter event, and an EventEmitter event with no listener throws --
+   * uncaught, outside any try/catch around `.listen()`, since the failure
+   * surfaces asynchronously once the OS actually attempts (and rejects) the
+   * bind. Previously there was no listener at all, so a rebind conflict
+   * (including the ordinary case of restarting this same server on the same
+   * port before the old socket had finished closing -- fixed above by
+   * awaiting closeServer first) went uncaught. Left uncaught, it isn't
+   * just this server left unresponsive: `enableVerboseLogging`'s own
+   * console output moves on as if nothing happened, and only a Notice here
+   * has any hope of telling the user why requests are going nowhere.
+   */
+  private handleServerError(kind: "HTTPS" | "HTTP", port: number | undefined, error: Error): void {
+    console.error(`[REST API] Failed to start the ${kind} server on port ${port}:`, error);
+    new Notice(
+      `Local REST API: the ${kind} server could not start (${describeServerError(port, error as NodeJS.ErrnoException)}). Check the port in this plugin's settings.`,
+    );
+  }
 
-      if (this.settings.enableVerboseLogging) {
-        console.debug(
-          `[REST API] Listening on https://${
-            this.settings.bindingHost ?? DefaultBindingHost
-          }:${this.settings.port}/`
+  async _refreshServerState() {
+    await Promise.all([
+      closeServer(this.secureServer),
+      closeServer(this.insecureServer),
+    ]);
+    this.secureServer = null;
+    this.insecureServer = null;
+
+    if ((this.settings.enableSecureServer ?? true) && this.settings.crypto) {
+      try {
+        const server = https.createServer(
+          {
+            key: this.settings.crypto.privateKey,
+            cert: buildServerCertificateChain(this.settings.crypto),
+          },
+          this.requestHandler.api
         );
+        configureHttpServerTimeouts(server);
+        server.on("error", (error) => {
+          this.handleServerError("HTTPS", this.settings.port, error);
+          if (this.secureServer === server) this.secureServer = null;
+        });
+        this.secureServer = server;
+        server.listen(
+          this.settings.port,
+          this.settings.bindingHost ?? DefaultBindingHost
+        );
+
+        if (this.settings.enableVerboseLogging) {
+          console.debug(
+            `[REST API] Listening on https://${
+              this.settings.bindingHost ?? DefaultBindingHost
+            }:${this.settings.port}/`
+          );
+        }
+      } catch (error) {
+        // Synchronous failures (e.g. malformed certificate/key material)
+        // land here; asynchronous bind failures land in the "error" handler
+        // registered above instead.
+        this.handleServerError("HTTPS", this.settings.port, error as Error);
       }
     }
 
-    if (this.insecureServer) {
-      this.insecureServer.closeAllConnections();
-      this.insecureServer.close();
-      this.insecureServer = null;
-    }
     if (this.settings.enableInsecureServer) {
-      this.insecureServer = http.createServer(this.requestHandler.api);
-      configureHttpServerTimeouts(this.insecureServer);
-      this.insecureServer.listen(
-        this.settings.insecurePort,
-        this.settings.bindingHost ?? DefaultBindingHost
-      );
-
-      if (this.settings.enableVerboseLogging) {
-        console.debug(
-          `[REST API] Listening on http://${
-            this.settings.bindingHost ?? DefaultBindingHost
-          }:${this.settings.insecurePort}/`
+      try {
+        const server = http.createServer(this.requestHandler.api);
+        configureHttpServerTimeouts(server);
+        server.on("error", (error) => {
+          this.handleServerError("HTTP", this.settings.insecurePort, error);
+          if (this.insecureServer === server) this.insecureServer = null;
+        });
+        this.insecureServer = server;
+        server.listen(
+          this.settings.insecurePort,
+          this.settings.bindingHost ?? DefaultBindingHost
         );
+
+        if (this.settings.enableVerboseLogging) {
+          console.debug(
+            `[REST API] Listening on http://${
+              this.settings.bindingHost ?? DefaultBindingHost
+            }:${this.settings.insecurePort}/`
+          );
+        }
+      } catch (error) {
+        this.handleServerError("HTTP", this.settings.insecurePort, error as Error);
       }
     }
   }

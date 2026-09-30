@@ -60,6 +60,9 @@ components:
           items:
             type: "string"
           type: "array"
+        metadataPossiblyStale:
+          description: "Present and true only when tags/frontmatter were served before Obsidian's metadata cache confirmed it had finished indexing this file's current contents. content is unaffected by this -- it is always read directly from the vault, never from that cache. Absent (not false) in the ordinary case."
+          type: "boolean"
         path:
           type: "string"
         stat:

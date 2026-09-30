@@ -163,6 +163,37 @@ describe("supplied content stands in for a second read", () => {
   });
 });
 
+describe("getFileMetadataObject flags cache staleness only when detected", () => {
+  // waitForFileCache is exercised directly in requestHandler.test.ts; this
+  // just checks that getFileMetadataObject passes its `timedOut` signal
+  // through to the response as metadataPossiblyStale, without asserting why
+  // the cache wait timed out -- that isn't something either function knows.
+  test("sets metadataPossiblyStale when the cache wait timed out", async () => {
+    const { app, ops } = setup("content\n");
+    const file = new TFile();
+    file.path = MD_PATH;
+    app.vault._getAbstractFileByPath = file;
+    jest
+      .spyOn(ops as unknown as { waitForFileCache: () => unknown }, "waitForFileCache")
+      .mockResolvedValue({ cache: null, timedOut: true });
+
+    const meta = await ops.getFileMetadataObject(file);
+
+    expect(meta.metadataPossiblyStale).toBe(true);
+  });
+
+  test("omits metadataPossiblyStale when the cache resolved normally", async () => {
+    const { app, ops } = setup("content\n");
+    const file = new TFile();
+    file.path = MD_PATH;
+    app.vault._getAbstractFileByPath = file;
+
+    const meta = await ops.getFileMetadataObject(file);
+
+    expect(meta.metadataPossiblyStale).toBeUndefined();
+  });
+});
+
 describe("readBinaryFileContent", () => {
   test("returns the adapter's bytes rather than a decoded string", async () => {
     const { app, ops } = setup("");
@@ -481,5 +512,38 @@ describe("Obsidian's declared event surface", () => {
 
   test("the cache is invalidated by every vault event", () => {
     expect([...VAULT_EVENTS].sort()).toEqual(declaredEvents("Vault"));
+  });
+});
+
+describe("openVaultFile", () => {
+  // openVaultFile is deliberately fire-and-forget (see its doc comment): the
+  // caller, POST /open/, has already sent its response by the time
+  // openLinkText settles. That only works because the rejection is caught
+  // internally instead of being left for an unhandled-rejection handler that
+  // doesn't exist -- a regression here would not fail loudly, just silently
+  // reintroduce an unhandled rejection.
+  test("opens the given path without awaiting completion", () => {
+    const { app, ops } = setup("content\n");
+    const openLinkText = jest.spyOn(app.workspace, "openLinkText").mockResolvedValue();
+
+    ops.openVaultFile(MD_PATH, true);
+
+    expect(openLinkText).toHaveBeenCalledWith(MD_PATH, "/", true);
+  });
+
+  test("a rejection from openLinkText is caught, not left unhandled", async () => {
+    const { app, ops } = setup("content\n");
+    jest.spyOn(app.workspace, "openLinkText").mockRejectedValue(new Error("no such leaf"));
+    const consoleError = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    ops.openVaultFile(MD_PATH);
+    // Let the rejected promise's .catch handler run.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining(MD_PATH),
+      expect.any(Error),
+    );
+    consoleError.mockRestore();
   });
 });

@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import http from "http";
+import type express from "express";
 import forge from "node-forge";
 import request from "supertest";
 
@@ -8,7 +9,12 @@ import { generateCryptoSettings } from "./certificates";
 // Mock McpHandler so tests don't load the MCP SDK (which bundles ESM-only zod)
 jest.mock("./mcpHandler", () => ({
   McpHandler: jest.fn().mockImplementation(() => ({
-    handleRequest: jest.fn().mockImplementation((_req: unknown, res: { status: (c: number) => { json: (b: unknown) => void } }) => {
+    // async: the real McpHandler.handleRequest is `async` and always returns
+    // a Promise, which requestHandler.ts relies on (`.catch(next)` on its
+    // return value). A synchronous mock here returns undefined instead --
+    // `.catch` on that throws "Cannot read properties of undefined (reading
+    // 'catch')" the moment any test's request reaches the /mcp/ route.
+    handleRequest: jest.fn().mockImplementation(async (_req: unknown, res: { status: (c: number) => { json: (b: unknown) => void } }) => {
       res.status(200).json({ ok: true });
     }),
     // Classification is exercised for real in mcpEndpoint.test.ts; here it stands in for
@@ -21,7 +27,13 @@ jest.mock("./mcpHandler", () => ({
 
 import RequestHandler from "./requestHandler";
 import { LocalRestApiSettings } from "./types";
-import { CERT_NAME } from "./constants";
+import {
+  CERT_NAME,
+  AUTH_FAILURE_DELAY_STEP_MS,
+  AUTH_FAILURE_DELAY_THRESHOLD,
+  AUTH_FAILURE_MAX_DELAY_MS,
+  AUTH_FAILURE_WINDOW_MS,
+} from "./constants";
 import {
   DestinationAlreadyExistsError,
   FileNotFoundError,
@@ -32,6 +44,8 @@ import {
   TFile,
   Command,
   CachedMetadata,
+  FileSystemAdapter,
+  Notice,
   PluginManifest,
   _prepareSimpleSearchMock,
 } from "../mocks/obsidian";
@@ -56,6 +70,7 @@ describe("requestHandler", () => {
     handler = new RequestHandler(app, manifest, settings);
     handler.setupRouter();
     server = http.createServer(handler.api);
+    Notice.instances = [];
   });
 
   afterEach(() => {
@@ -92,6 +107,287 @@ describe("requestHandler", () => {
         .get(arbitraryAuthenticatedRoute)
         .set("Authorization", `Bearer ${API_KEY}`)
         .expect(200);
+    });
+  });
+
+  describe("failed-authentication throttling", () => {
+    const arbitraryAuthenticatedRoute = "/vault/";
+
+    // recordAuthFailureAndGetDelayMs is exercised directly (rather than only
+    // through HTTP requests) so these cases run instantly instead of paying
+    // for AUTH_FAILURE_MAX_DELAY_MS in real wall-clock time -- the wiring
+    // into the actual request path is covered separately below.
+    function recordFailure(): number {
+      // @ts-ignore: Accessing private method for testing
+      return handler.recordAuthFailureAndGetDelayMs({ socket: {} } as any);
+    }
+
+    test("returns no delay while failures stay at or below the threshold", () => {
+      const delays = Array.from({ length: AUTH_FAILURE_DELAY_THRESHOLD }, () =>
+        recordFailure(),
+      );
+
+      expect(delays.every((ms) => ms === 0)).toBe(true);
+    });
+
+    test("returns a delay that grows with each failure past the threshold", () => {
+      for (let i = 0; i < AUTH_FAILURE_DELAY_THRESHOLD; i++) recordFailure();
+
+      expect(recordFailure()).toBe(AUTH_FAILURE_DELAY_STEP_MS);
+      expect(recordFailure()).toBe(AUTH_FAILURE_DELAY_STEP_MS * 2);
+      expect(recordFailure()).toBe(AUTH_FAILURE_DELAY_STEP_MS * 3);
+    });
+
+    test("caps the delay at AUTH_FAILURE_MAX_DELAY_MS", () => {
+      const callsToReachCap =
+        AUTH_FAILURE_DELAY_THRESHOLD +
+        AUTH_FAILURE_MAX_DELAY_MS / AUTH_FAILURE_DELAY_STEP_MS;
+
+      let lastDelay = 0;
+      for (let i = 0; i < callsToReachCap + 5; i++) lastDelay = recordFailure();
+
+      expect(lastDelay).toBe(AUTH_FAILURE_MAX_DELAY_MS);
+    });
+
+    test("forgets failures once they age out of the window", () => {
+      const nowSpy = jest.spyOn(Date, "now");
+      try {
+        nowSpy.mockReturnValue(0);
+        for (let i = 0; i < AUTH_FAILURE_DELAY_THRESHOLD + 3; i++) recordFailure();
+
+        nowSpy.mockReturnValue(AUTH_FAILURE_WINDOW_MS + 1);
+        // Every earlier failure is now outside the window, so this one is
+        // counted as if it were the first.
+        expect(recordFailure()).toBe(0);
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    test("shows a Notice once on crossing into the throttled state, not on every failure after", () => {
+      // Below the threshold: no Notice yet, matching the "no delay" behavior
+      // above -- nothing worth surfacing has happened.
+      for (let i = 0; i < AUTH_FAILURE_DELAY_THRESHOLD; i++) recordFailure();
+      expect(Notice.instances).toHaveLength(0);
+
+      // The failure that crosses the threshold is the one transition worth a
+      // Notice -- a console warning alone is easy to miss, but showing one
+      // per subsequent failure in an ongoing burst would just be noise.
+      recordFailure();
+      expect(Notice.instances).toHaveLength(1);
+      expect(Notice.instances[0].message).toContain(String(AUTH_FAILURE_DELAY_THRESHOLD + 1));
+
+      recordFailure();
+      recordFailure();
+      expect(Notice.instances).toHaveLength(1);
+    });
+
+    test("end-to-end: throttling engages on the real request path and a correct key still authenticates", async () => {
+      for (let i = 0; i < AUTH_FAILURE_DELAY_THRESHOLD + 2; i++) {
+        await request(server)
+          .get(arbitraryAuthenticatedRoute)
+          .set("Authorization", "Bearer wrong-key")
+          .expect(401);
+      }
+
+      await request(server)
+        .get(arbitraryAuthenticatedRoute)
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .expect(200);
+    });
+
+    test("end-to-end: the /mcp/ router's own auth check is throttled the same way", async () => {
+      for (let i = 0; i < AUTH_FAILURE_DELAY_THRESHOLD + 2; i++) {
+        await request(server)
+          .get("/mcp/")
+          .set("Authorization", "Bearer wrong-key")
+          .expect(401);
+      }
+
+      await request(server)
+        .get(arbitraryAuthenticatedRoute)
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .expect(200);
+    });
+  });
+
+  describe("handle() request timeout", () => {
+    // handle() is exercised directly, bypassing supertest/HTTP, so these
+    // tests can use a tiny timeoutMs (real setTimeout, no fake-timer
+    // interaction with the underlying server) instead of waiting out the
+    // real REQUEST_TIMEOUT_MS default on every run.
+    function fakeRes(): express.Response {
+      const res = {
+        headersSent: false,
+        statusCode: undefined as number | undefined,
+        body: undefined as unknown,
+      };
+      // @ts-ignore: minimal stand-in for express.Response
+      res.status = jest.fn((code: number) => {
+        res.statusCode = code;
+        return res;
+      });
+      // @ts-ignore: minimal stand-in for express.Response
+      res.json = jest.fn((body: unknown) => {
+        // Matches real Express: writing to a response that already sent its
+        // headers throws, it doesn't silently overwrite.
+        if (res.headersSent) {
+          throw new Error("Cannot set headers after they are sent to the client");
+        }
+        res.headersSent = true;
+        res.body = body;
+        return res;
+      });
+      return res as unknown as express.Response;
+    }
+
+    function callHandle(
+      fn: (req: express.Request, res: express.Response) => Promise<void>,
+      timeoutMs: number,
+    ): {
+      res: express.Response & { statusCode?: number; body?: unknown };
+      next: jest.Mock;
+    } {
+      const req = { method: "GET", url: "/test" } as express.Request;
+      const res = fakeRes();
+      const next = jest.fn() as unknown as express.NextFunction;
+      // @ts-ignore: Accessing private method for testing
+      const middleware = handler.handle(fn, timeoutMs);
+      middleware(req, res, next);
+      return { res: res as express.Response & { statusCode?: number; body?: unknown }, next };
+    }
+
+    test("a handler that resolves well before the timeout is unaffected", async () => {
+      const { res, next } = callHandle(async (_req, r) => {
+        r.status(200).json({ ok: true });
+      }, 1000);
+
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(res.statusCode).toBe(200);
+      expect(next).not.toHaveBeenCalled();
+    });
+
+    test("a handler that never resolves is answered with a 503 once the timeout elapses", async () => {
+      const neverResolves = () => new Promise<void>(() => {});
+      const { res, next } = callHandle(neverResolves, 20);
+
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      expect(res.statusCode).toBe(503);
+      expect((res.body as { message: string }).message).toContain("0.02s");
+      expect(next).not.toHaveBeenCalled();
+    });
+
+    test("a handler that fails after the timeout does not reach errorHandler a second time", async () => {
+      let rejectLate!: (e: Error) => void;
+      const lateFailure = () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectLate = reject;
+        });
+      const { res, next } = callHandle(lateFailure, 10);
+
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(res.statusCode).toBe(503);
+
+      rejectLate(new Error("disk full, eventually"));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(next).not.toHaveBeenCalled();
+    });
+
+    test("a handler that resumes after the timeout and tries to respond does not crash the server", async () => {
+      // Reproduces the collision this wrapper cannot prevent (it can't cancel
+      // the handler -- see handle()'s doc comment): the handler's own late
+      // res.json() call throws because headers are already sent. What
+      // matters is that the throw is contained -- caught as this handler's
+      // own rejection, not left to escape as an unhandled rejection or a
+      // second attempt to answer the request.
+      let releaseHandler!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releaseHandler = resolve;
+      });
+      const fn = async (_req: express.Request, r: express.Response) => {
+        await gate;
+        r.status(200).json({ tooLate: true });
+      };
+      const { res, next } = callHandle(fn, 10);
+
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(res.statusCode).toBe(503);
+
+      releaseHandler();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      // The invariant that matters: the late, colliding write never reaches
+      // errorHandler a second time (it throws inside fn's own async body,
+      // which turns into a rejection this wrapper already knows to swallow
+      // once settled). res.statusCode itself is not asserted here -- like
+      // real Express, this fake res still lets `.status()` mutate that
+      // property even after `.json()` has thrown on a prior send, since
+      // that mutation is harmless and never reaches the client.
+      expect(next).not.toHaveBeenCalled();
+    });
+
+    test("a handler that succeeds after the timeout logs that fact under verbose logging", async () => {
+      // Symmetric with the late-failure case above: once the 503 has gone
+      // out, whether the handler eventually succeeded or failed is the one
+      // thing this wrapper can report without guessing why it was slow.
+      handler.settings.enableVerboseLogging = true;
+      const consoleDebug = jest.spyOn(console, "debug").mockImplementation(() => {});
+
+      let releaseHandler!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releaseHandler = resolve;
+      });
+      const fn = async (_req: express.Request, r: express.Response) => {
+        await gate;
+        r.status(200).json({ ok: true });
+      };
+      const { res } = callHandle(fn, 10);
+
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(res.statusCode).toBe(503);
+      consoleDebug.mockClear();
+
+      releaseHandler();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(consoleDebug).toHaveBeenCalledWith(
+        expect.stringContaining("completed after its response had already timed out"),
+      );
+      consoleDebug.mockRestore();
+    });
+
+    test("a handler that genuinely fails after the timeout logs that fact, not a false completion", async () => {
+      // The two late-outcome tests above both resolve/reject via the same
+      // mechanism a real handler would (a late res.json() collision) or a
+      // genuine rejection -- this confirms the message-text check added to
+      // tell them apart doesn't misclassify a real error as a late success
+      // just because it arrived through the same settled-rejection branch.
+      handler.settings.enableVerboseLogging = true;
+      const consoleDebug = jest.spyOn(console, "debug").mockImplementation(() => {});
+
+      let rejectLate!: (e: Error) => void;
+      const lateFailure = () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectLate = reject;
+        });
+      const { res } = callHandle(lateFailure, 10);
+
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(res.statusCode).toBe(503);
+      consoleDebug.mockClear();
+
+      const failure = new Error("disk full, eventually");
+      rejectLate(failure);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(consoleDebug).toHaveBeenCalledWith(
+        expect.stringContaining("failed after its response had already timed out"),
+        failure,
+      );
+      consoleDebug.mockRestore();
     });
   });
 
@@ -1004,6 +1300,9 @@ describe("requestHandler", () => {
     test("non-bytes content", async () => {
       const arbitraryFilePath = "somefile.md";
       const arbitraryBytes = "bytes";
+      // "bytes" isn't valid JSON, so body-parser rejects it -- errorHandler
+      // logs that SyntaxError, which is the point of this test, not a signal.
+      const consoleError = jest.spyOn(console, "error").mockImplementation(() => {});
 
       await request(server)
         .put(`/vault/${arbitraryFilePath}`)
@@ -1013,6 +1312,7 @@ describe("requestHandler", () => {
         .expect(400);
 
       expect(app.vault.adapter._write).toBeUndefined();
+      consoleError.mockRestore();
     });
   });
 
@@ -1086,6 +1386,9 @@ describe("requestHandler", () => {
     test("non-bytes content", async () => {
       const arbitraryFilePath = "somefile.md";
       const arbitraryBytes = "bytes";
+      // "bytes" isn't valid JSON, so body-parser rejects it -- errorHandler
+      // logs that SyntaxError, which is the point of this test, not a signal.
+      const consoleError = jest.spyOn(console, "error").mockImplementation(() => {});
 
       await request(server)
         .post(`/vault/${arbitraryFilePath}`)
@@ -1095,6 +1398,7 @@ describe("requestHandler", () => {
         .expect(400);
 
       expect(app.vault.adapter._write).toBeUndefined();
+      consoleError.mockRestore();
     });
   });
 
@@ -3359,6 +3663,35 @@ describe("requestHandler", () => {
     });
   });
 
+  describe("vaultInfoGet", () => {
+    test("returns the vault's name", async () => {
+      app.vault._name = "my-vault";
+
+      const result = await request(server)
+        .get("/vault-info/")
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .expect(200);
+
+      expect(result.body).toEqual({ name: "my-vault" });
+    });
+
+    test("includes basePath when the adapter is a FileSystemAdapter", async () => {
+      app.vault._name = "my-vault";
+      app.vault.adapter = new FileSystemAdapter();
+      app.vault.adapter._basePath = "/Users/uwe/vault";
+
+      const result = await request(server)
+        .get("/vault-info/")
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .expect(200);
+
+      expect(result.body).toEqual({
+        name: "my-vault",
+        basePath: "/Users/uwe/vault",
+      });
+    });
+  });
+
   describe("commandGet", () => {
     test("acceptable", async () => {
       const arbitraryCommand = new Command();
@@ -4080,6 +4413,22 @@ describe("requestHandler", () => {
   });
 
   describe("waitForFileCache", () => {
+    let consoleWarn: jest.SpyInstance;
+
+    beforeEach(() => {
+      // Two tests below deliberately let the wait hit its timeout, which
+      // logs via console.warn -- that's the mechanism working as designed
+      // (see vaultOperations.ts's waitForFileCache and getFileMetadataObject's
+      // metadataPossiblyStale flag, which this file confirms return the
+      // right values and that vaultOperations.test.ts confirms is correctly
+      // threaded into the response), not a signal for this test run.
+      consoleWarn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      consoleWarn.mockRestore();
+    });
+
     test("returns immediately if cache is already available", async () => {
       const testFile = new TFile();
       testFile.path = "test.md";
@@ -4093,10 +4442,11 @@ describe("requestHandler", () => {
 
       // Access the private method via the handler instance
       // @ts-ignore: Accessing private method for testing
-      const result = await handler.operations.waitForFileCache(testFile);
+      const { cache, timedOut } = await handler.operations.waitForFileCache(testFile);
 
-      expect(result).not.toBeNull();
-      expect(result?.frontmatter?.title).toBe("Test");
+      expect(cache).not.toBeNull();
+      expect(cache?.frontmatter?.title).toBe("Test");
+      expect(timedOut).toBe(false);
     });
 
     test("waits for cache change event when cache is initially null", async () => {
@@ -4119,10 +4469,11 @@ describe("requestHandler", () => {
         app.metadataCache._emitChanged(testFile);
       }, 50);
 
-      const result = await cachePromise;
+      const { cache, timedOut } = await cachePromise;
 
-      expect(result).not.toBeNull();
-      expect(result?.frontmatter?.title).toBe("Loaded");
+      expect(cache).not.toBeNull();
+      expect(cache?.frontmatter?.title).toBe("Loaded");
+      expect(timedOut).toBe(false);
     });
 
     test("ignores cache change events for other files", async () => {
@@ -4153,10 +4504,11 @@ describe("requestHandler", () => {
         app.metadataCache._emitChanged(testFile);
       }, 50);
 
-      const result = await cachePromise;
+      const { cache, timedOut } = await cachePromise;
 
-      expect(result).not.toBeNull();
-      expect(result?.frontmatter?.title).toBe("Correct");
+      expect(cache).not.toBeNull();
+      expect(cache?.frontmatter?.title).toBe("Correct");
+      expect(timedOut).toBe(false);
     });
 
     test("returns current cache state on timeout", async () => {
@@ -4168,10 +4520,12 @@ describe("requestHandler", () => {
 
       // Use a very short timeout for the test
       // @ts-ignore: Accessing private method for testing
-      const result = await handler.operations.waitForFileCache(testFile, 100);
+      const { cache, timedOut } = await handler.operations.waitForFileCache(testFile, 100);
 
-      // Should return null (timeout reached without cache becoming available)
-      expect(result).toBeNull();
+      // Should return null cache (timeout reached without cache becoming
+      // available) and flag that it did not resolve in time.
+      expect(cache).toBeNull();
+      expect(timedOut).toBe(true);
     });
 
     test("cleans up event listener after cache becomes available", async () => {
@@ -4229,6 +4583,17 @@ describe("requestHandler", () => {
     // async route handler was silently swallowed (void pattern), leaving the
     // HTTP request to hang forever with no response.  These tests verify that
     // unexpected errors are turned into 500 responses instead.
+    let consoleError: jest.SpyInstance;
+
+    beforeEach(() => {
+      // Both tests deliberately trigger errorHandler; it logs the full stack
+      // via console.error, which is the fix working, not a signal.
+      consoleError = jest.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      consoleError.mockRestore();
+    });
 
     test("synchronous throw inside async vault GET returns 500", async () => {
       jest.spyOn(handler.operations, "listVaultDirectory").mockImplementation(() => {
@@ -4335,6 +4700,69 @@ describe("requestHandler", () => {
         .set("Authorization", `Bearer ${API_KEY}`)
         .expect(204);
       expect(res.headers["content-location"]).toEqual(activeFilePath);
+    });
+  });
+
+  describe("active-file write handlers surface failures instead of hanging", () => {
+    // Regression coverage for redirectToVaultPath's callers: they used to
+    // fire the underlying _vaultPut/_vaultPost/_vaultPatch/_vaultDelete call
+    // with `void`, discarding its promise. A thrown error then became an
+    // unhandled rejection instead of reaching errorHandler, and since
+    // nothing ever called res.json/res.status, the request just hung
+    // forever instead of failing fast with a 500. Before the fix, these
+    // tests would time out rather than fail cleanly.
+    const activeFilePath = "notes/active.md";
+    let consoleError: jest.SpyInstance;
+
+    beforeEach(() => {
+      const activeFile = Object.assign(new TFile(), { path: activeFilePath });
+      jest.spyOn(app.workspace, "getActiveFile").mockReturnValue(activeFile);
+      // These tests deliberately trigger errorHandler, which logs the full
+      // stack via console.error -- expected here (that's the fix working),
+      // not a signal, so it's suppressed to keep real failures visible in
+      // test output instead of buried under three intentional stack dumps.
+      consoleError = jest.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      consoleError.mockRestore();
+    });
+
+    test("PUT surfaces a write failure as a 500 instead of hanging", async () => {
+      jest
+        .spyOn(handler.operations, "writeFileContent")
+        .mockRejectedValue(new Error("disk full"));
+
+      await request(server)
+        .put("/active/")
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .set("Content-Type", "text/markdown")
+        .send("# Replaced\n")
+        .expect(500);
+    });
+
+    test("POST surfaces an append failure as a 500 instead of hanging", async () => {
+      jest
+        .spyOn(handler.operations, "appendFileContent")
+        .mockRejectedValue(new Error("disk full"));
+
+      await request(server)
+        .post("/active/")
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .set("Content-Type", "text/markdown")
+        .send("appended\n")
+        .expect(500);
+    });
+
+    test("DELETE still surfaces an unexpected deletion failure as a 500", async () => {
+      jest
+        .spyOn(handler.operations, "deleteVaultFile")
+        .mockRejectedValue(new Error("locked"));
+
+      await request(server)
+        .delete("/active/")
+        .set("Authorization", `Bearer ${API_KEY}`)
+        .expect(500);
     });
   });
 

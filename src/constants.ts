@@ -13,6 +13,44 @@ export const BUILT_IN_ROUTES = ["/", "/openapi.yaml", `/${CERT_NAME}`];
  */
 export const MCP_SESSIONLESS_PROTOCOL_VERSION = "2026-07-28";
 
+/**
+ * Failed-authentication throttling. Deliberately global rather than keyed by
+ * source IP or any other client-supplied identifier: IP is trivial to rotate
+ * (a new client instance, a VPN hop, DHCP renewal) and nothing about a
+ * request reliably identifies the *machine* behind it — a MAC address isn't
+ * visible past the local network segment even when the client is on the same
+ * LAN, and modern OSes randomize it per network by default anyway. A global
+ * counter can't be sidestepped by changing who you appear to be, at the cost
+ * of one shared failure budget for every legitimate client too — acceptable
+ * here because the actual defense against brute force is the 256-bit random
+ * key (see LocalRestApi.onload's key generation), not this throttle. This
+ * only raises the cost of noisy, automated guessing and gives the access log
+ * something to show for it; it is not, on its own, a strong barrier.
+ */
+export const AUTH_FAILURE_WINDOW_MS = 60_000;
+export const AUTH_FAILURE_DELAY_THRESHOLD = 5;
+export const AUTH_FAILURE_DELAY_STEP_MS = 50;
+export const AUTH_FAILURE_MAX_DELAY_MS = 2000;
+
+/**
+ * How long a REST request (routes wrapped by `RequestHandler.handle()`) is
+ * allowed to wait for a response before this server gives up and answers 503
+ * itself, rather than leaving the connection open indefinitely. See
+ * `handle()`'s own doc comment for what this can and cannot fix.
+ *
+ * Ordinary vault reads/writes are sub-second on local disk, so 5s is already
+ * generous by that measure -- but the one realistic case that measure
+ * doesn't account for is a vault living on a cloud-sync client (iCloud
+ * Drive, Nextcloud, Dropbox, OneDrive): a write can legitimately block for a
+ * few seconds waiting on that client's own lock or flush, independent of any
+ * bug here. 5s leaves some room for that without coming anywhere near what
+ * "hanging forever" looked like before this existed. If this value turns
+ * out to produce false-positive 503s on a particular setup, it is safe to
+ * raise -- it trades a slower failure report for fewer false alarms, not
+ * correctness either way.
+ */
+export const REQUEST_TIMEOUT_MS = 5_000;
+
 export const DEFAULT_SETTINGS: LocalRestApiSettings = {
   port: 27124,
   insecurePort: 27123,

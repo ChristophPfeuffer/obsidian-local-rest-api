@@ -4,6 +4,7 @@ import {
   CachedMetadata,
   Command,
   Component,
+  FileSystemAdapter,
   MarkdownRenderer,
   prepareSimpleSearch,
   TFile,
@@ -43,6 +44,7 @@ import {
   SearchContext,
   SearchJsonResponseItem,
   SearchResponseItem,
+  VaultInfoObject,
 } from "./types";
 import { toArrayBuffer } from "./utils";
 
@@ -155,13 +157,23 @@ export class VaultOperations {
     }
   }
 
+  /**
+   * `timedOut: true` means the wait hit `timeoutMs` before Obsidian
+   * confirmed its metadata cache was current for `file` -- `cache` is
+   * whatever `getFileCache` returned at that point regardless, since a stale
+   * or partial answer is more useful to a caller than none. Callers building
+   * an API response from this should say only that the cache was not
+   * confirmed current in time -- not attribute a cause, since none is
+   * knowable from here (see `REQUEST_TIMEOUT_MS`'s doc comment for the same
+   * caution about the request-level timeout this mirrors).
+   */
   private waitForFileCache(
     file: TFile,
     timeoutMs = 5000,
-  ): Promise<CachedMetadata | null> {
+  ): Promise<{ cache: CachedMetadata | null; timedOut: boolean }> {
     const existingCache = this.app.metadataCache.getFileCache(file);
     if (existingCache) {
-      return Promise.resolve(existingCache);
+      return Promise.resolve({ cache: existingCache, timedOut: false });
     }
 
     return new Promise((resolve) => {
@@ -174,7 +186,7 @@ export class VaultOperations {
           resolved = true;
           this.app.metadataCache.off("changed", onCacheChange);
           window.clearTimeout(timeoutId);
-          resolve(this.app.metadataCache.getFileCache(file));
+          resolve({ cache: this.app.metadataCache.getFileCache(file), timedOut: false });
         }
       };
 
@@ -185,7 +197,7 @@ export class VaultOperations {
           console.warn(
             `[REST API] Timeout waiting for metadata cache for ${file.path} after ${timeoutMs}ms`,
           );
-          resolve(this.app.metadataCache.getFileCache(file));
+          resolve({ cache: this.app.metadataCache.getFileCache(file), timedOut: true });
         }
       }, timeoutMs);
 
@@ -196,7 +208,7 @@ export class VaultOperations {
         resolved = true;
         this.app.metadataCache.off("changed", onCacheChange);
         window.clearTimeout(timeoutId);
-        resolve(cacheAfterListener);
+        resolve({ cache: cacheAfterListener, timedOut: false });
       }
     });
   }
@@ -326,7 +338,7 @@ export class VaultOperations {
     includeContent = true,
     content?: string,
   ): Promise<FileMetadataObject> {
-    const cache = await this.waitForFileCache(file);
+    const { cache, timedOut } = await this.waitForFileCache(file);
 
     const frontmatter = { ...(cache?.frontmatter ?? {}) };
     delete frontmatter.position;
@@ -366,6 +378,7 @@ export class VaultOperations {
       links,
       backlinks,
       unresolvedLinks,
+      ...(timedOut ? { metadataPossiblyStale: true as const } : {}),
     };
   }
 
@@ -873,6 +886,19 @@ export class VaultOperations {
     return commands;
   }
 
+  /** The vault's own display name, plus its filesystem base path when the
+   *  adapter exposes one (desktop only — absent on mobile or any
+   *  non-filesystem adapter). */
+  getVaultInfo(): VaultInfoObject {
+    const adapter = this.app.vault.adapter;
+    const basePath =
+      adapter instanceof FileSystemAdapter ? adapter.getBasePath() : undefined;
+    return {
+      name: this.app.vault.getName(),
+      ...(basePath !== undefined ? { basePath } : {}),
+    };
+  }
+
   executeCommand(commandId: string): void {
     const cmd = this.app.commands.commands[commandId];
     if (!cmd) {
@@ -882,6 +908,15 @@ export class VaultOperations {
   }
 
   openVaultFile(filePath: string, newLeaf = false): void {
-    void this.app.workspace.openLinkText(filePath, "/", newLeaf);
+    // Intentionally fire-and-forget: the caller (POST /open/) has already
+    // responded by the time this settles, since a client asking Obsidian to
+    // focus a file has no reason to wait on that UI action finishing. The
+    // rejection still needs a home, though -- an un-awaited promise with no
+    // .catch is an unhandled rejection the moment openLinkText throws (e.g.
+    // an invalid path), and while that's non-fatal in Obsidian's renderer
+    // process, it's still an unexplained error with nothing to explain it.
+    this.app.workspace.openLinkText(filePath, "/", newLeaf).catch((error) => {
+      console.error(`[REST API] Failed to open "${filePath}":`, error);
+    });
   }
 }

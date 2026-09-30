@@ -167,10 +167,32 @@ export interface FileMetadataObject {
   links: string[];
   backlinks: string[];
   unresolvedLinks: string[];
+  /**
+   * Present (and `true`) only when `tags`/`frontmatter` were served before
+   * Obsidian's metadata cache confirmed it had finished indexing this file's
+   * current contents -- the wait for that confirmation timed out. This is
+   * exactly what's detectable from here: that the cache wasn't confirmed
+   * current in time, not why it was slow to update. `content` itself is
+   * unaffected -- it's always read directly from the vault, never from this
+   * cache.
+   */
+  metadataPossiblyStale?: true;
 }
 
 export interface DocumentMapObject {
   headings: string[];
   blocks: string[];
   frontmatterFields: string[];
+}
+
+export interface VaultInfoObject {
+  /** The vault's configured display name — the value to use as the `vault`
+   *  query parameter when building an `obsidian://` URI (e.g.
+   *  `obsidian://open?vault=<name>&file=<path>`), since the vault-relative
+   *  paths this API otherwise deals in are not enough on their own to build a
+   *  link that opens in the Obsidian app. */
+  name: string;
+  /** The vault's absolute filesystem base path, when the adapter exposes one
+   *  (desktop only). Undefined on mobile or any non-filesystem adapter. */
+  basePath?: string;
 }

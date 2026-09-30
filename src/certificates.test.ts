@@ -18,8 +18,20 @@ import {
 import { CryptoSettings } from "./types";
 
 // 2048-bit RSA generation takes seconds per key under jest; the certificate
-// shape under test does not depend on the key size.
+// shape under test does not depend on the key size, so most tests here stay
+// at this size for speed.
 const TEST_KEY_SIZE = 1024;
+
+// A handful of tests below present the generated certificate in a real TLS
+// handshake (https.createServer / tls.connect), not just forge's own
+// parsing. Node's OpenSSL binding enforces its own minimum key strength for
+// the end-entity certificate at connection time regardless of what forge
+// itself will construct -- a 1024-bit served key fails there with "ee key
+// too small" before application code ever sees the request. This constant
+// is used only at those specific call sites; every other generateKeyPair /
+// generateCryptoSettings call in this file stays on the fast, handshake-free
+// TEST_KEY_SIZE above.
+const HANDSHAKE_TEST_KEY_SIZE = 2048;
 
 interface KeyUsage {
   digitalSignature?: boolean;
@@ -240,6 +252,22 @@ describe("generateCryptoSettings", () => {
   });
 });
 
+describe("default key size", () => {
+  // The one place in this file that generates real production-size keys
+  // (no keySize override) -- deliberately a single test, since 3072-bit
+  // node-forge generation is the "seconds per key" case TEST_KEY_SIZE
+  // exists to avoid everywhere else. This is what actually pins the
+  // DEFAULT_KEY_SIZE promised in that constant's doc comment: nothing else
+  // in this file would notice a silent regression back to a weaker default.
+  test("the CA and leaf are both generated at the modern 3072-bit default", () => {
+    const crypto = generateCryptoSettings({});
+    const ca = parse(crypto.caCert);
+    const leaf = parse(crypto.cert);
+    expect((ca.publicKey as forge.pki.rsa.PublicKey).n.bitLength()).toBe(3072);
+    expect((leaf.publicKey as forge.pki.rsa.PublicKey).n.bitLength()).toBe(3072);
+  });
+});
+
 describe("getCertificateStandardsIssue", () => {
   test("a freshly generated leaf has no issue", () => {
     const crypto = generateCryptoSettings({ keySize: TEST_KEY_SIZE });
@@ -398,7 +426,11 @@ describe("renewServerCertificateIfNeeded", () => {
     beforeAll(() => {
       // A CA whose subjectKeyIdentifier is not the SHA-1 of its public key
       // (RFC 5280 permits any unique value), signed with its own key.
-      const keypair = forge.pki.rsa.generateKeyPair(TEST_KEY_SIZE);
+      // This CA ends up served (appended to the leaf's chain) in the real
+      // handshake below, so it needs HANDSHAKE_TEST_KEY_SIZE too -- OpenSSL
+      // enforces a separate minimum for a chain's CA key ("ca key too
+      // small"), distinct from the end-entity leaf's own check.
+      const keypair = forge.pki.rsa.generateKeyPair(HANDSHAKE_TEST_KEY_SIZE);
       const attrs = [{ name: "commonName", value: "Bring Your Own CA" }];
       const ca = forge.pki.createCertificate();
       ca.serialNumber = "03";
@@ -434,7 +466,7 @@ describe("renewServerCertificateIfNeeded", () => {
     });
 
     test("the renewed leaf names the CA's actual subject key identifier as its authority", async () => {
-      const renewed = renewServerCertificateIfNeeded(byo, { now, keySize: TEST_KEY_SIZE });
+      const renewed = renewServerCertificateIfNeeded(byo, { now, keySize: HANDSHAKE_TEST_KEY_SIZE });
       expect(renewed).not.toBeNull();
       if (!renewed) return;
       expect(authorityKeyIdentifierOf(parse(renewed.cert))).toEqual(CUSTOM_SKI);
@@ -458,7 +490,9 @@ function signLeafWithCa(
   altNames: { type: number; ip?: string; value?: string }[],
 ): { cert: string; privateKey: string } {
   const ca = parse(crypto.caCert);
-  const keypair = forge.pki.rsa.generateKeyPair(TEST_KEY_SIZE);
+  // This forged leaf is always the one presented in a real handshake by its
+  // two call sites below -- see HANDSHAKE_TEST_KEY_SIZE's comment.
+  const keypair = forge.pki.rsa.generateKeyPair(HANDSHAKE_TEST_KEY_SIZE);
   const certificate = forge.pki.createCertificate();
   certificate.serialNumber = "02";
   certificate.publicKey = keypair.publicKey;
@@ -549,13 +583,16 @@ describe("CA name constraints", () => {
   test("the generated leaf satisfies its own CA's constraints in a real handshake", async () => {
     const crypto = generateCryptoSettings({
       subjectAltNames: "obsidian.local",
-      keySize: TEST_KEY_SIZE,
+      keySize: HANDSHAKE_TEST_KEY_SIZE,
     });
     await expect(handshakeWith(crypto, crypto.caCert)).resolves.toBe(true);
   });
 
   test("a client trusting the CA rejects a leaf the CA signed for a hostname outside its constraints", async () => {
-    const crypto = generateCryptoSettings({ keySize: TEST_KEY_SIZE });
+    // This CA is served alongside the forged leaf below, so it needs
+    // HANDSHAKE_TEST_KEY_SIZE too -- see the "ca key too small" comment on
+    // the user-supplied-CA beforeAll above.
+    const crypto = generateCryptoSettings({ keySize: HANDSHAKE_TEST_KEY_SIZE });
     const forged = signLeafWithCa(crypto, [
       { type: 7, ip: "127.0.0.1" },
       { type: 2, value: "bank.example.com" },
@@ -563,15 +600,22 @@ describe("CA name constraints", () => {
     await expect(
       handshakeWith({ ...forged, caCert: crypto.caCert }, crypto.caCert),
     ).rejects.toThrow(/permitted subtree violation/i);
-  });
+    // This test's own logic runs in well under a second; the time goes into
+    // three synchronous, unaccelerated 2048-bit RSA keygens (CA, its real
+    // leaf, and the forged leaf) via node-forge. That routinely clears
+    // jest's default 5000ms on a quiet machine but not under load, so it
+    // gets a wider margin rather than a flaky red X. See the identical
+    // comment on the sibling "...outside its constraints" test below.
+  }, 15000);
 
   test("a client trusting the CA rejects a leaf the CA signed for an address outside its constraints", async () => {
-    const crypto = generateCryptoSettings({ keySize: TEST_KEY_SIZE });
+    const crypto = generateCryptoSettings({ keySize: HANDSHAKE_TEST_KEY_SIZE });
     const forged = signLeafWithCa(crypto, [{ type: 7, ip: "127.0.0.1" }, { type: 7, ip: "10.0.0.1" }]);
     await expect(
       handshakeWith({ ...forged, caCert: crypto.caCert }, crypto.caCert),
     ).rejects.toThrow(/permitted subtree violation/i);
-  });
+    // Same three-keygen cost as its sibling above -- see that comment.
+  }, 15000);
 });
 
 describe("getReportedValidityDays", () => {
@@ -636,7 +680,7 @@ describe("buildServerCertificateChain", () => {
   // completes a fully verified TLS handshake with a server presenting the
   // generated chain, addressed by an IP subjectAltName.
   test("a client trusting only the CA verifies a handshake with the served chain", async () => {
-    const crypto = generateCryptoSettings({ keySize: TEST_KEY_SIZE });
+    const crypto = generateCryptoSettings({ keySize: HANDSHAKE_TEST_KEY_SIZE });
     const server = https.createServer(
       { key: crypto.privateKey, cert: buildServerCertificateChain(crypto) },
       (_req, res) => res.end("ok"),
@@ -674,7 +718,10 @@ describe("buildServerCertificateChain", () => {
   });
 
   test("a client trusting the CA rejects a leaf it did not sign", async () => {
-    const served = generateCryptoSettings({ keySize: TEST_KEY_SIZE });
+    // served is presented in the handshake and needs HANDSHAKE_TEST_KEY_SIZE;
+    // other is only ever used as the client's (mismatched) trust anchor, so
+    // it never hits the "ee" check and can stay on the fast size.
+    const served = generateCryptoSettings({ keySize: HANDSHAKE_TEST_KEY_SIZE });
     const other = generateCryptoSettings({ keySize: TEST_KEY_SIZE });
     const server = https.createServer(
       { key: served.privateKey, cert: buildServerCertificateChain(served) },

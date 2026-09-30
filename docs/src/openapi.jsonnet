@@ -149,6 +149,10 @@ std.manifestYamlDoc(
                 type: 'string',
               },
             },
+            metadataPossiblyStale: {
+              type: 'boolean',
+              description: "Present and true only when tags/frontmatter were served before Obsidian's metadata cache confirmed it had finished indexing this file's current contents. content is unaffected by this -- it is always read directly from the vault, never from that cache. Absent (not false) in the ordinary case.",
+            },
           },
         },
         Error: {
@@ -444,6 +448,41 @@ std.manifestYamlDoc(
                       { name: 'work', count: 2 },
                       { name: 'work/tasks', count: 2 },
                     ],
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/vault-info/': {
+        get: {
+          tags: [
+            'Vault',
+          ],
+          summary: 'Get information about the vault itself.\n',
+          description: "Returns the vault's configured display name — the value to use as the `vault` query parameter when building an `obsidian://` URI (e.g. `obsidian://open?vault=<name>&file=<path>`), since the vault-relative paths this API otherwise deals in are not enough on their own to build a link that opens in the Obsidian app — and, on desktop, the vault's absolute filesystem base path.\n",
+          responses: {
+            '200': {
+              description: "The vault's name and, on desktop, its base path.",
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      name: {
+                        type: 'string',
+                        description: "The vault's configured display name.",
+                      },
+                      basePath: {
+                        type: 'string',
+                        description: 'Absolute filesystem path to the vault. Present on desktop only.',
+                      },
+                    },
+                  },
+                  example: {
+                    name: 'My Vault',
+                    basePath: '/Users/example/Documents/My Vault',
                   },
                 },
               },

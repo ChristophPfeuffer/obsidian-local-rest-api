@@ -111,6 +111,9 @@ function makeMockOps() {
     listCommands: jest
       .fn()
       .mockReturnValue([{ id: "cmd-id", name: "Command Name" }]),
+    getVaultInfo: jest
+      .fn()
+      .mockReturnValue({ name: "test-vault", basePath: "/mock/vault/path" }),
     executeCommand: jest.fn(),
     openVaultFile: jest.fn(),
     moveVaultFile: jest.fn().mockResolvedValue(""),
@@ -220,8 +223,8 @@ describe("McpHandler", () => {
 
   // ---- tool registration --------------------------------------------------
 
-  test("registers all 18 tools", () => {
-    expect(registerTool).toHaveBeenCalledTimes(18);
+  test("registers all 19 tools", () => {
+    expect(registerTool).toHaveBeenCalledTimes(19);
     const names = registerTool.mock.calls.map((c: unknown[]) => c[0]);
     expect(names).toEqual(
       expect.arrayContaining([
@@ -237,6 +240,7 @@ describe("McpHandler", () => {
         "vault_copy",
         "vault_get_document_map",
         "active_file_get_path",
+        "vault_info",
         "search_query",
         "search_simple",
         "tag_list",
@@ -257,6 +261,7 @@ describe("McpHandler", () => {
         "vault_read_binary",
         "vault_get_document_map",
         "active_file_get_path",
+        "vault_info",
         "search_query",
         "search_simple",
         "tag_list",
@@ -1218,6 +1223,20 @@ describe("McpHandler", () => {
     });
   });
 
+  // ---- vault_info -----------------------------------------------------------
+
+  describe("vault_info", () => {
+    test("returns the vault's name and base path", async () => {
+      const cb = getToolCallback("vault_info");
+      const result = await cb({});
+      expect(ops.getVaultInfo).toHaveBeenCalled();
+      expect(parseText(result)).toEqual({
+        name: "test-vault",
+        basePath: "/mock/vault/path",
+      });
+    });
+  });
+
   // ---- search_query -------------------------------------------------------
 
   test("search_query calls searchJsonLogic and returns results", async () => {
@@ -1333,8 +1352,8 @@ describe("McpHandler", () => {
 
       const first = await send(1);
       const second = await send(2);
-      expect(first.body.result.tools).toHaveLength(18);
-      expect(second.body.result.tools).toHaveLength(18);
+      expect(first.body.result.tools).toHaveLength(19);
+      expect(second.body.result.tools).toHaveLength(19);
       expect(first.headers["mcp-session-id"]).toBeUndefined();
       expect(second.headers["mcp-session-id"]).toBeUndefined();
     });
@@ -1474,7 +1493,7 @@ describe("McpHandler", () => {
         .send(sessionlessRequest(1, "tools/list"))
         .expect(200);
 
-      expect(res.body.result.tools).toHaveLength(18);
+      expect(res.body.result.tools).toHaveLength(19);
       expect(res.headers["mcp-session-id"]).toBeUndefined();
     });
 
@@ -1602,7 +1621,7 @@ describe("McpHandler", () => {
         .expect(200);
 
       const message = sseResult(res.text);
-      expect(message.result.tools).toHaveLength(18);
+      expect(message.result.tools).toHaveLength(19);
       const vaultList = (message.result.tools as { name: string; inputSchema: unknown }[]).find(
         (t) => t.name === "vault_list",
       );
