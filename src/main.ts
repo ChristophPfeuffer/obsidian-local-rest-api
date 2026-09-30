@@ -147,7 +147,7 @@ export default class LocalRestApi extends Plugin {
   private handleServerError(kind: "HTTPS" | "HTTP", port: number | undefined, error: Error): void {
     console.error(`[REST API] Failed to start the ${kind} server on port ${port}:`, error);
     new Notice(
-      `Local REST API: the ${kind} server could not start (${describeServerError(port, error as NodeJS.ErrnoException)}). Check the port in this plugin's settings.`,
+      `Local REST API: the ${kind} server could not start (${describeServerError(port, error)}). Check the port in this plugin's settings.`,
     );
   }
 

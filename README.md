@@ -113,7 +113,14 @@ Or add it manually to `.mcp.json` in your project root (project-scoped) or confi
 
 #### Claude Desktop
 
-Claude Desktop does not natively support remote HTTP MCP servers, but you can bridge it with [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) (requires Node.js). Add the following to `claude_desktop_config.json`:
+**With this fork's installers (Windows/macOS):** two separate steps, each started by double-clicking `installWIN.cmd` or `installMAC.command` in its repository.
+
+1. **This repository — the plugin.** Checks the repository (lint, unit tests, installer tests, build — nothing is installed if one fails), then copies `main.js`, `manifest.json` and `styles.css` into `<vault>/.obsidian/plugins/obsidian-local-rest-api/`. The vault comes from Obsidian's own vault list; `data.json` is never touched. Enable the plugin once in Obsidian afterwards.
+2. **The separate MCP-Bridge-Obsidian repository — the Claude Desktop connection.** Installs a small, dependency-free stdio↔HTTP bridge to `%LOCALAPPDATA%\obsidian-mcp-bridge` (macOS: `~/Library/Application Support/obsidian-mcp-bridge`) and writes the Claude Desktop entry `obsidian`, reading the API key and the plugin's CA certificate from `data.json`.
+
+Node.js 22+ (for building) comes from PATH or is downloaded once into `%LOCALAPPDATA%\node` (macOS: `~/Library/Application Support/node`), shared by the installers and SHA-256 verified. Files are compared first — unchanged ones are left alone, and you're only asked when something would change.
+
+**Manual setup with `mcp-remote`:** Claude Desktop does not natively support remote HTTP MCP servers, but you can bridge it with [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) (requires Node.js). Add the following to `claude_desktop_config.json`:
 
 - **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`

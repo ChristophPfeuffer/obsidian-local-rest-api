@@ -1,1 +1,6 @@
 docs/ linguist-vendored
+
+# Windows batch files need CRLF (labels/goto can break with LF);
+# macOS shell scripts need LF (bash fails on \r).
+*.cmd text eol=crlf
+*.command text eol=lf

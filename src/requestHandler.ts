@@ -279,7 +279,7 @@ export default class RequestHandler {
     ) {
       const delayMs = this.recordAuthFailureAndGetDelayMs(req);
       if (delayMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await new Promise((resolve) => window.setTimeout(resolve, delayMs));
       }
       this.returnCannedResponse(res, {
         errorCode: ErrorCode.ApiKeyAuthorizationRequired,
@@ -2388,7 +2388,7 @@ export default class RequestHandler {
     return (req, res, next) => {
       let settled = false;
 
-      const timer = setTimeout(() => {
+      const timer = window.setTimeout(() => {
         if (settled) return;
         settled = true;
         if (!res.headersSent) {
@@ -2401,9 +2401,8 @@ export default class RequestHandler {
           });
         }
       }, timeoutMs);
-      // Doesn't itself keep the process alive if everything else has
-      // finished -- there is nothing left this timer could usefully do then.
-      timer.unref?.();
+      // (No timer.unref(): window.setTimeout returns a plain number inside
+      // Obsidian, and a pending timer there doesn't keep anything alive.)
 
       fn(req, res).then(
         () => {
@@ -2421,7 +2420,7 @@ export default class RequestHandler {
             return;
           }
           settled = true;
-          clearTimeout(timer);
+          window.clearTimeout(timer);
         },
         (err: unknown) => {
           if (settled) {
@@ -2443,7 +2442,7 @@ export default class RequestHandler {
             return;
           }
           settled = true;
-          clearTimeout(timer);
+          window.clearTimeout(timer);
           next(err);
         },
       );
@@ -2466,18 +2465,25 @@ export default class RequestHandler {
 
     const mcpRouter = express.Router();
     mcpRouter.use(cors(corsOptions));
-    mcpRouter.use(async (req, res, next) => {
-      if (!this.requestIsAuthenticated(req)) {
-        const delayMs = this.recordAuthFailureAndGetDelayMs(req);
-        if (delayMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
-        }
+    // Express 4 ignores a middleware's returned promise, so the async part
+    // runs inside a wrapper that hands any rejection to next() instead of
+    // leaving it unhandled.
+    mcpRouter.use((req, res, next) => {
+      if (this.requestIsAuthenticated(req)) {
+        next();
+        return;
+      }
+      const delayMs = this.recordAuthFailureAndGetDelayMs(req);
+      const reject = () => {
         this.returnCannedResponse(res, {
           errorCode: ErrorCode.ApiKeyAuthorizationRequired,
         });
-        return;
+      };
+      if (delayMs > 0) {
+        new Promise((resolve) => window.setTimeout(resolve, delayMs)).then(reject).catch(next);
+      } else {
+        reject();
       }
-      next();
     });
     // Body parsing runs before the version filter: deciding what an unrecognised version
     // header means requires knowing whether the request is sessionless- or sessionful-shaped, and
