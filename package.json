@@ -26,7 +26,8 @@
     "lint": "eslint src/",
     "test": "jest",
     "test:integration": "jest --config jest.integration.config.js --runInBand",
-    "test:installer": "node --test \"installer/*.test.cjs\""
+    "test:installer": "node --test \"installer/*.test.cjs\"",
+    "test:launcher": "bash installer/test-launcher-mac.sh"
   },
   "keywords": [],
   "author": "",

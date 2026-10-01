@@ -25,3 +25,6 @@ dist/*
 
 # Local Obsidian vault used for manual testing
 test_vault/
+
+# macOS Finder metadata
+.DS_Store
