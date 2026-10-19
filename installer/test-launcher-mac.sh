@@ -2,7 +2,7 @@
 # Scenario test for the Node.js selection / update logic in installMAC.command.
 #
 #   bash installer/test-launcher-mac.sh            all cases
-#   bash installer/test-launcher-mac.sh update     only cases whose name contains "update"
+#   bash installer/test-launcher-mac.sh "rule 2"   only cases whose name contains "rule 2"
 #   bash installer/test-launcher-mac.sh --list     list the case names
 #   VERBOSE=1 bash installer/test-launcher-mac.sh  also show the launcher output
 #
@@ -12,7 +12,9 @@
 # this machine are ignored — nothing outside the temp folder is touched.
 # Needs bash and a node (20+) on PATH. Works on macOS and Linux.
 #
-# Kept IDENTICAL in MCP-Zotero and obsidian-local-rest-api (under installer/).
+# Shared file: identical copies ship with every installer that uses the shared
+# Node.js folder (each under installer/). Change it in one repository, then
+# copy the change to every other copy.
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 LAUNCHER="$REPO/installMAC.command"
@@ -23,10 +25,16 @@ if [ -z "$REAL_NODE" ]; then
 fi
 [ -x "$REAL_NODE" ] || { echo "No node found (PATH or ~/Library/Application Support/node)."; exit 1; }
 FILTER="$1"
-MIN="$(sed -n 's/^MIN_NODE=\([0-9]*\)$/\1/p' "$LAUNCHER")"
+# MIN_NODE in the launcher: MAJOR or MAJOR.MINOR (e.g. 20 or 22.13).
+MIN_RAW="$(sed -n 's/^MIN_NODE=\([0-9][0-9.]*\).*$/\1/p' "$LAUNCHER" | head -1)"
+MIN="${MIN_RAW%%.*}"     # major
+MINOR=0
+case "$MIN_RAW" in *.*) MINOR="${MIN_RAW#*.}"; MINOR="${MINOR%%.*}" ;; esac
 OLD="$((MIN - 2)).0.0"   # too old
-OK="$MIN.1.0"            # new enough
+OK="$MIN.$((MINOR + 1)).0"   # new enough
 NEW="$((MIN + 4)).2.0"   # newer than OK
+# Just below MIN_NODE: same major, one minor lower (or the major before).
+if [ "$MINOR" -gt 0 ]; then BELOW="$MIN.$((MINOR - 1)).9"; else BELOW="$((MIN - 1)).99.0"; fi
 DL="99.0.0"              # what the stubbed download "installs"
 
 PASS=0
@@ -117,7 +125,7 @@ says()       { echo "$OUT" | grep -qF -- "$1" && ok || bad "output should contai
 not_says()   { echo "$OUT" | grep -qF -- "$1" && bad "output should not contain: $1" || ok; }
 has_private(){ [ -d "$N/node-v$1-darwin-x64" ] && ok || bad "shared folder should have v$1"; }
 no_private() { [ ! -d "$N/node-v$1-darwin-x64" ] && ok || bad "shared folder should not have v$1"; }
-choice_is()  { [ "$(cat "$N/use-node" 2>/dev/null)" = "$1" ] && ok || bad "use-node should be '$1' (is '$(cat "$N/use-node" 2>/dev/null)')"; }
+no_choice()  { [ ! -e "$N/use-node" ] && ok || bad "use-node (earlier versions' remembered choice) should be gone"; }
 claude_is()  { "$REAL_NODE" -e 'const c=require(process.argv[1]);process.exit(c.mcpServers.zotero.command===process.argv[2]?0:1)' "$CFG" "$1" && ok || bad "Claude entry should use $1"; }
 # Starts a case unless it is filtered out (or only listed with --list).
 start() {
@@ -128,71 +136,65 @@ start() {
 }
 finish() { [ -n "$VERBOSE" ] && { echo "----- $CASE"; echo "$OUT"; }; }
 
-# --- fresh install ----------------------------------------------------------
-if start "fresh: installed Node passes the test -> used"; then
+# --- rule 3: nothing in the shared folder yet --------------------------------
+if start "rule 3: installed Node passes the test -> used, nothing downloaded"; then
 foreign "$OK"; run ""
-uses "$OK"; says "passed."; no_private "$DL"; choice_is ""; finish; fi
+uses "$OK"; says "passed."; no_private "$DL"; finish; fi
 
-if start "fresh: installed Node too old -> download"; then
+if start "rule 3: installed Node too old -> download"; then
 foreign "$OLD"; run ""
 uses "$DL"; says "too old for this installer"; has_private "$DL"; finish; fi
 
-if start "fresh: installed Node fails the installer tests -> download"; then
+if start "rule 3: installed Node just below MIN_NODE -> download"; then
+foreign "$BELOW"; run ""
+uses "$DL"; says "too old for this installer"; has_private "$DL"; finish; fi
+
+if start "rule 3: installed Node fails the installer tests -> download"; then
 foreign "$OK" failtests; run ""
 uses "$DL"; says "installer tests failed"; has_private "$DL"; finish; fi
 
-if start "fresh: installed Node without npm -> download"; then
+if start "rule 3: installed Node without npm -> download"; then
 foreign "$OK" nonpm; run ""
 uses "$DL"; says "npm does not run"; has_private "$DL"; finish; fi
 
-if start "fresh: no Node at all -> download"; then
+if start "rule 3: no Node at all -> download"; then
 run ""
 uses "$DL"; says "No Node.js in the shared Node folder yet."; has_private "$DL"; finish; fi
 
-# --- re-run -----------------------------------------------------------------
-if start "re-run: our copy, installed Node older -> no question"; then
-private "$OK"; foreign "$((MIN + 0)).0.1"; run ""
-uses "$OK"; not_says "Use it from now on?"; says "not used, left unchanged"; finish; fi
+# --- rule 1: the shared copy is new enough ----------------------------------
+if start "rule 1: shared copy new enough -> used"; then
+private "$OK"; claude_on "$N/node-v$OK-darwin-x64/bin/node"; run ""
+uses "$OK"; no_private "$DL"; claude_is "$N/node-v$OK-darwin-x64/bin/node"; finish; fi
 
-if start "re-run: newer installed Node, answer n -> stay"; then
-private "$OK"; foreign "$NEW"; claude_on "$N/node-v$OK-darwin-x64/bin/node"; run "n\n"
-uses "$OK"; says "Use it from now on?"; has_private "$OK"; choice_is ""; claude_is "$N/node-v$OK-darwin-x64/bin/node"; finish; fi
+if start "rule 1: newer installed Node -> shared copy still used, no question"; then
+private "$OK"; foreign "$NEW"; run ""
+uses "$OK"; not_says "[Y/n]"; says "not used, left unchanged"; finish; fi
 
-if start "re-run: newer installed Node, Enter + Enter -> move, delete our copy"; then
-private "$OK"; foreign "$NEW"; claude_on "$N/node-v$OK-darwin-x64/bin/node"; run "\n\n"
-uses "$NEW"; choice_is "$F"; no_private "$OK"; claude_is "$F"; finish; fi
+if start "rule 1: older shared copies -> deleted, Claude re-pointed"; then
+private "$OLD"; private "$OK"; claude_on "$N/node-v$OLD-darwin-x64/bin/node"; run ""
+uses "$OK"; no_private "$OLD"; has_private "$OK"; claude_is "$N/node-v$OK-darwin-x64/bin/node"; finish; fi
 
-if start "re-run: newer installed Node, Enter + n -> move, keep our copy"; then
-private "$OK"; foreign "$NEW"; run "\nn\n"
-uses "$NEW"; choice_is "$F"; has_private "$OK"; finish; fi
-
-if start "re-run: newer installed Node fails the tests -> no question"; then
-private "$OK"; foreign "$NEW" failtests; run ""
-uses "$OK"; says "installer tests failed"; not_says "Use it from now on?"; finish; fi
-
-if start "re-run: saved choice still fine -> used"; then
+if start "rule 1: use-node left by an earlier launcher -> removed, ignored"; then
 private "$OK"; foreign "$NEW"; mkdir -p "$N"; echo "$F" > "$N/use-node"; run ""
-uses "$NEW"; says "Using the Node.js chosen earlier"; finish; fi
+uses "$OK"; no_choice; finish; fi
 
-if start "re-run: saved choice now too old -> back to shared folder"; then
-private "$OK"; foreign "$OLD"; mkdir -p "$N"; echo "$F" > "$N/use-node"; run ""
-uses "$OK"; says "back to the shared Node folder"; choice_is ""; finish; fi
-
-# --- update case (our copy too old) -----------------------------------------
-if start "update: no usable installed Node -> download, old copy replaced, Claude re-pointed"; then
+# --- rule 2: the shared copy is too old -------------------------------------
+if start "rule 2: shared copy too old -> download, old copy replaced, Claude re-pointed"; then
 private "$OLD"; claude_on "$N/node-v$OLD-darwin-x64/bin/node"; run ""
 uses "$DL"; says "too old for this installer"; no_private "$OLD"; has_private "$DL"
 claude_is "$N/node-v$DL-darwin-x64/bin/node"; finish; fi
 
-if start "update: installed Node passes, Enter + Enter -> move, old copy deleted"; then
-private "$OLD"; foreign "$OK"; claude_on "$N/node-v$OLD-darwin-x64/bin/node"; run "\n\n"
-uses "$OK"; choice_is "$F"; no_private "$OLD"; no_private "$DL"; claude_is "$F"; finish; fi
+if start "rule 2: shared copy just below MIN_NODE -> download, old copy replaced"; then
+private "$BELOW"; claude_on "$N/node-v$BELOW-darwin-x64/bin/node"; run ""
+uses "$DL"; says "too old for this installer"; no_private "$BELOW"; has_private "$DL"
+claude_is "$N/node-v$DL-darwin-x64/bin/node"; finish; fi
 
-if start "update: installed Node passes, answer n -> download instead"; then
-private "$OLD"; foreign "$OK"; run "n\n"
-uses "$DL"; choice_is ""; no_private "$OLD"; finish; fi
+if start "rule 2: installed Node would pass -> still replaced by a download"; then
+private "$OLD"; foreign "$OK"; claude_on "$N/node-v$OLD-darwin-x64/bin/node"; run ""
+uses "$DL"; no_private "$OLD"; has_private "$DL"; not_says "Checking the Node.js installed"
+claude_is "$N/node-v$DL-darwin-x64/bin/node"; finish; fi
 
-if start "update: Claude config unreadable -> old copy NOT deleted"; then
+if start "rule 2: Claude config unreadable -> old copy NOT deleted"; then
 private "$OLD"; echo "{ broken" > "$CFG"; run ""
 uses "$DL"; has_private "$OLD"; says "could not be re-pointed"; finish; fi
 
@@ -200,6 +202,6 @@ uses "$DL"; has_private "$OLD"; says "could not be re-pointed"; finish; fi
 [ "$FILTER" = --list ] && exit 0
 [ "$RAN" -eq 0 ] && { echo "No case matches \"$FILTER\" (see --list)."; exit 1; }
 echo
-echo "Launcher scenarios (MIN_NODE=$MIN, real node $("$REAL_NODE" -v)): $RAN cases, $PASS checks passed, $FAIL failed."
+echo "Launcher scenarios (MIN_NODE=$MIN_RAW, real node $("$REAL_NODE" -v)): $RAN cases, $PASS checks passed, $FAIL failed."
 echo "(VERBOSE=1 shows the launcher output of every case.)"
 [ "$FAIL" -eq 0 ]

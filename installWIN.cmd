@@ -1,35 +1,48 @@
 @echo off
 setlocal EnableExtensions
 
-rem Double-click launcher for the Obsidian plugin installer (install.js) on
-rem Windows. Keep it in the same folder as install.js.
+rem Double-click launcher for this repository's installer (install.js) on
+rem Windows. Keep it in the same folder as install.js. Arguments are passed on
+rem to install.js (its header lists the options).
 rem
-rem Which Node.js is used (MIN_NODE differs: Zotero MCP 20, Obsidian plugin 22)
-rem is decided by the PowerShell code embedded at the end of this file (below
-rem the marker line); it hands the chosen folder back to this script.
+rem Which Node.js is used is decided by the PowerShell code embedded at the end
+rem of this file (below the marker line); it hands the chosen folder back to
+rem this script. MIN_NODE below is this installer's minimum, MAJOR or
+rem MAJOR.MINOR; keep it in sync with "engines" in package.json.
+rem   1. The shared Node folder %LOCALAPPDATA%\node has a copy that is new
+rem      enough: it is used.
+rem   2. The copy there is too old: the newest LTS is downloaded into the
+rem      shared folder, Claude Desktop (node-wrapper.cmd and entries) is
+rem      re-pointed from the old copy to it (installer\relink-node.cjs, config
+rem      backed up), then the old copy is deleted. Nothing is deleted if
+rem      re-pointing fails.
+rem   3. No copy there yet: an installed Node.js (PATH, Program Files,
+rem      nvm-windows) is used if it passes the compatibility test (version >=
+rem      MIN_NODE, its npm runs, this repo's installer tests
+rem      installer\*.test.cjs pass with it). Otherwise the newest LTS is
+rem      downloaded into the shared folder.
+rem Downloads: only the build for this machine; MCP_NODE_CHANNEL=current for
+rem the newest "Current" release; SHA-256 verified before unpacking; no admin
+rem rights; MCP_NO_NODE_DOWNLOAD=1 disables them. Other Node.js installs are
+rem never changed.
 rem
-rem Fresh install (nothing in the shared Node folder %LOCALAPPDATA%\node, used
-rem by the Zotero MCP, Obsidian plugin and Obsidian bridge installers):
-rem   An installed Node.js (PATH, Program Files, nvm-windows) is used if it
-rem   passes the compatibility test: version >= MIN_NODE, its npm runs, and
-rem   this repo's installer tests (installer\*.test.cjs) pass with it.
-rem   Otherwise the newest LTS is downloaded into the shared Node folder (only
-rem   the build for this machine; MCP_NODE_CHANNEL=current for the newest
-rem   "Current" release; SHA-256 verified before unpacking; no admin rights;
-rem   MCP_NO_NODE_DOWNLOAD=1 disables it).
+rem Why these rules:
+rem - Each run decides from what is there (the shared folder, installed
+rem   Node.js) and this installer's MIN_NODE. No choice is remembered between
+rem   runs, so installers with different minimums cannot undo each other's
+rem   choice, and Claude Desktop needs none: node-wrapper.cmd and its entries
+rem   hold the Node.js path themselves.
+rem - A shared copy that is too old is replaced, not swapped for an installed
+rem   Node.js: the shared folder only changes when an installer changes it,
+rem   while an installed Node.js is managed by its own installer and can be
+rem   upgraded, switched (nvm-windows) or removed underneath Claude Desktop.
 rem
-rem Re-run:
-rem   The Node.js in use (the shared Node folder, or one chosen earlier, saved
-rem   in its file use-node.txt; delete that file to go back) stays, unless a
-rem   NEWER installed Node.js passes the compatibility test. Then you are asked
-rem   whether to move to it (Enter = yes) and, if so, whether to delete the
-rem   copies in the shared Node folder (Enter = yes). Only too-old copies
-rem   there: the same offer, otherwise the newest LTS is downloaded and the old
-rem   copies are replaced.
-rem
-rem Claude Desktop (node-wrapper.cmd and entries) is re-pointed first
-rem (installer\relink-node.cjs, config backed up); nothing is deleted if that
-rem fails. Other Node.js installs are never changed.
+rem Shared launcher: the same file ships with every installer that uses the
+rem shared Node folder; only MIN_NODE differs. Change it in one repository,
+rem then copy the change to the others. Other installers or tools may run the
+rem same Node.js: when a copy is replaced, installer\relink-node.cjs re-points
+rem the Claude Desktop entries that use it; anything else that runs it is not
+rem updated and must be re-pointed by its own installer.
 rem
 rem Then runs `node install.js` and keeps the window open so you can read it.
 
@@ -56,11 +69,26 @@ if errorlevel 1 goto nodefail
 goto run
 
 :nodeok
-rem Sets NODE_MAJOR from `node -v` (e.g. v24.1.0 -> 24); errorlevel 0 if >= MIN_NODE.
+rem Sets NODE_MAJOR / NODE_MINOR from `node -v` (e.g. v24.1.0 -> 24 / 1);
+rem errorlevel 0 if >= MIN_NODE (MAJOR or MAJOR.MINOR; major and minor compared).
 set "NODE_MAJOR="
-for /f "tokens=1 delims=v." %%a in ('node -v 2^>nul') do set "NODE_MAJOR=%%a"
+set "NODE_MINOR="
+set "MIN_MAJOR="
+set "MIN_MINOR="
+for /f "tokens=1,2 delims=v." %%a in ('node -v 2^>nul') do (
+  set "NODE_MAJOR=%%a"
+  set "NODE_MINOR=%%b"
+)
+for /f "tokens=1,2 delims=." %%a in ("%MIN_NODE%") do (
+  set "MIN_MAJOR=%%a"
+  set "MIN_MINOR=%%b"
+)
 if not defined NODE_MAJOR exit /b 1
-if %NODE_MAJOR% GEQ %MIN_NODE% exit /b 0
+if not defined NODE_MINOR set "NODE_MINOR=0"
+if not defined MIN_MINOR set "MIN_MINOR=0"
+if %NODE_MAJOR% GTR %MIN_MAJOR% exit /b 0
+if %NODE_MAJOR% LSS %MIN_MAJOR% exit /b 1
+if %NODE_MINOR% GEQ %MIN_MINOR% exit /b 0
 exit /b 1
 
 :nodefail
@@ -99,9 +127,11 @@ rem ---------------------------------------------------------------------------
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$MinMajor   = [int]$env:MIN_NODE
+# MIN_NODE is MAJOR or MAJOR.MINOR; [version] needs at least two parts.
+$MinText    = "$env:MIN_NODE".Trim()
+if ($MinText -notmatch '\.') { $MinText += '.0' }
+$MinVersion = [version]$MinText
 $Root       = Join-Path $env:LOCALAPPDATA 'node'
-$ChoiceFile = Join-Path $Root 'use-node.txt'
 $Repo       = $env:ZM_REPO
 $BaseUrl    = 'https://nodejs.org/download/release'
 $script:Tmp = $null
@@ -109,14 +139,6 @@ $script:Tmp = $null
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
-
-function Read-Answer([string]$prompt) { return (Read-Host $prompt) }
-
-# Enter = yes.
-function Ask-Yes([string]$question) {
-    $a = Read-Answer ($question + ' [Y/n]')
-    return -not ("$a" -match '^\s*[nN]')
-}
 
 function Get-Platform {
     $arch = $env:PROCESSOR_ARCHITEW6432
@@ -227,7 +249,7 @@ function Get-ForeignNodes {
 # Compatibility test "for our purpose"; prints one line.
 function Test-Compat($n) {
     $label = '  Compatibility test: Node.js v' + $n.Version + ' at ' + $n.Exe + ' - '
-    if ($n.Version.Major -lt $MinMajor) { Write-Host ($label + 'too old (needs ' + $MinMajor + ' or newer).'); return $false }
+    if ($n.Version -lt $MinVersion) { Write-Host ($label + 'too old (needs ' + $env:MIN_NODE + ' or newer).'); return $false }
     if (-not (Test-NodeNpm $n.Exe)) { Write-Host ($label + 'npm does not run.'); return $false }
     if (-not (Invoke-InstallerTests $n.Exe)) { Write-Host ($label + 'installer tests failed.'); return $false }
     Write-Host ($label + 'passed.')
@@ -272,7 +294,7 @@ function Install-PrivateNode {
         break
     }
     if (-not $ver) { throw ('No ' + $channel + ' release with a ' + $plat + ' zip found in the release index.') }
-    if ([int]($ver -replace '^v(\d+)\..*$', '$1') -lt $MinMajor) { throw ('Newest ' + $channel + ' release ' + $ver + ' is older than the required Node.js ' + $MinMajor + '.') }
+    if ([version]($ver.TrimStart('v')) -lt $MinVersion) { throw ('Newest ' + $channel + ' release ' + $ver + ' is older than the required Node.js ' + $env:MIN_NODE + '.') }
     Write-Host ('Newest ' + $channel + ' release for ' + $plat + ': ' + $ver)
 
     $dirUrl = $BaseUrl + '/' + $ver
@@ -314,10 +336,11 @@ function Install-PrivateNode {
 }
 
 # ---------------------------------------------------------------------------
-# Replacing and moving (Claude Desktop is re-pointed first)
+# Replacing (Claude Desktop is re-pointed first)
 # ---------------------------------------------------------------------------
 
-# Update case: deletes copies older than the one in use, without asking.
+# Deletes copies older than the one in use, without asking - after
+# re-pointing Claude Desktop from them (rule 2; also cleans up leftovers).
 function Remove-OlderPrivateNodes($cur) {
     $olds = @(Get-PrivateNodes | Where-Object { $_.Version -lt $cur.Version })
     if ($olds.Count -eq 0) { return }
@@ -332,39 +355,13 @@ function Remove-OlderPrivateNodes($cur) {
     Write-Host ''
 }
 
-# Moves to installed Node.js $f (already tested): asks (Enter = yes),
-# re-points Claude Desktop, saves the choice, then offers to delete the copies
-# in the shared Node folder (Enter = yes). Returns $true if moved.
-function Move-ToForeign($f, $cur) {
-    if (-not (Ask-Yes ('Newer Node.js v' + $f.Version + ' found at ' + $f.Exe + '. Use it from now on?'))) { Write-Host ''; return $false }
-    $olds = @(Get-PrivateNodes | ForEach-Object { $_.Exe })
-    if ($cur -and ($cur.Exe -ne $f.Exe)) { $olds += $cur.Exe }
-    if (-not (Invoke-Relink $f.Exe $f.Exe $olds)) {
-        Write-Host 'Not moved: Claude Desktop could not be re-pointed.'
-        Write-Host ''
-        return $false
-    }
-    New-Item -ItemType Directory -Force -Path $Root | Out-Null
-    [IO.File]::WriteAllText($ChoiceFile, $f.Exe)
-    Write-Host ('Moved to ' + $f.Exe + ' (saved in ' + $ChoiceFile + '; delete that file to go back).')
-    $privs = @(Get-PrivateNodes)
-    if ($privs.Count -gt 0 -and (Ask-Yes ('Delete the Node.js copies in ' + $Root + '?'))) {
-        foreach ($p in $privs) {
-            Remove-Item -LiteralPath $p.Dir -Recurse -Force
-            Write-Host ('Deleted ' + $p.Dir)
-        }
-    }
-    Write-Host ''
-    return $true
-}
-
 function Show-UnusedForeign($foreign, $cur) {
     $shown = $false
     foreach ($f in $foreign) {
         if ($f.Exe -eq $cur.Exe) { continue }
         if (-not $shown) { Write-Host 'Note: other Node.js on this PC (not used, left unchanged):'; $shown = $true }
         $line = '  v' + $f.Version + ' at ' + $f.Exe
-        if ($f.Version.Major -lt $MinMajor) { $line += ' (too old for this installer)' }
+        if ($f.Version -lt $MinVersion) { $line += ' (too old for this installer)' }
         Write-Host $line
     }
     if ($shown) { Write-Host '' }
@@ -377,70 +374,35 @@ function Show-UnusedForeign($foreign, $cur) {
 $code = 1
 try {
     $foreign = @(Get-ForeignNodes)
-    $best = $foreign | Where-Object { $_.Version.Major -ge $MinMajor } | Sort-Object Version -Descending | Select-Object -First 1
+    $best = $foreign | Where-Object { $_.Version -ge $MinVersion } | Sort-Object Version -Descending | Select-Object -First 1
     $cur = $null
 
-    # 1) Re-run: a Node.js chosen earlier instead of the shared Node folder.
-    if (Test-Path -LiteralPath $ChoiceFile) {
-        $chosen = ([IO.File]::ReadAllText($ChoiceFile)).Trim()
-        $v = $null
-        if ($chosen -and (Test-Path -LiteralPath $chosen -PathType Leaf)) { $v = Get-NodeVersion $chosen }
-        if ($v -and $v.Major -ge $MinMajor) {
-            $cur = New-NodeInfo $chosen $v
-            Write-Host ('Using the Node.js chosen earlier: ' + $chosen + ' (v' + $v + ')')
-            Write-Host ('(delete ' + $ChoiceFile + ' to go back to the shared Node folder)')
-        } else {
-            Write-Host ('The Node.js chosen earlier (' + $chosen + ') is missing or too old for this installer;')
-            Write-Host 'back to the shared Node folder.'
-            Remove-Item -LiteralPath $ChoiceFile -Force
-        }
+    # Left by earlier versions of this launcher (a remembered choice); no longer used.
+    $oldChoice = Join-Path $Root 'use-node.txt'
+    if (Test-Path -LiteralPath $oldChoice) { Remove-Item -LiteralPath $oldChoice -Force }
+
+    $priv = @(Get-PrivateNodes)
+    if ($priv.Count -gt 0 -and $priv[0].Version -ge $MinVersion) {
+        # Rule 1: the shared copy is new enough.
+        $cur = $priv[0]
+    } elseif ($priv.Count -gt 0) {
+        # Rule 2: the shared copy is too old -> download; replaced below.
+        Write-Host ('Node.js in the shared Node folder is too old for this installer (needs ' + $env:MIN_NODE + ' or newer):')
+        Write-Host ('  v' + $priv[0].Version + ' at ' + $priv[0].Dir)
+        Write-Host 'Updating to the newest Node.js; the old copy is replaced.'
         Write-Host ''
-    }
-
-    # 2) Re-run: the shared Node folder.
-    $tooOld = $null
-    if (-not $cur) {
-        $priv = @(Get-PrivateNodes)
-        if ($priv.Count -gt 0) {
-            if ($priv[0].Version.Major -ge $MinMajor) { $cur = $priv[0] } else { $tooOld = $priv[0] }
-        }
-    }
-
-    if ($cur) {
-        # Re-run: move to a newer installed Node.js if it passes the test.
-        if ($best -and ($best.Exe -ne $cur.Exe) -and ($best.Version -gt $cur.Version)) {
-            Write-Host 'Checking the newer Node.js installed on this PC:'
-            if (Test-Compat $best) {
-                Write-Host ''
-                if (Move-ToForeign $best $cur) { $cur = $best }
-            } else { Write-Host '' }
-        }
+        $cur = Install-PrivateNode
     } else {
-        if ($tooOld) {
-            # Update case (re-run): our copy is too old.
-            Write-Host ('Node.js in the shared Node folder is too old for this installer (needs ' + $MinMajor + ' or newer):')
-            Write-Host ('  v' + $tooOld.Version + ' at ' + $tooOld.Dir)
-            Write-Host ''
-            if ($best) {
-                Write-Host 'Checking the Node.js installed on this PC:'
-                if (Test-Compat $best) {
-                    Write-Host ''
-                    if (Move-ToForeign $best $null) { $cur = $best }
-                } else { Write-Host '' }
-            }
-            if (-not $cur) { Write-Host 'Updating to the newest Node.js; the old copy is replaced.'; Write-Host '' }
-        } else {
-            # Fresh install: use an installed Node.js if it passes the test.
-            Write-Host 'No Node.js in the shared Node folder yet.'
-            if ($best) {
-                Write-Host 'Checking the Node.js installed on this PC:'
-                if (Test-Compat $best) { $cur = $best }
-            } elseif ($foreign.Count -gt 0) {
-                Write-Host ('The Node.js installed on this PC is too old for this installer (needs ' + $MinMajor + ' or newer).')
-            }
-            if (-not $cur) { Write-Host ('Installing Node.js ' + $MinMajor + '+ into the shared Node folder.') }
-            Write-Host ''
+        # Rule 3: nothing shared yet -> an installed Node.js that passes, else download.
+        Write-Host 'No Node.js in the shared Node folder yet.'
+        if ($best) {
+            Write-Host 'Checking the Node.js installed on this PC:'
+            if (Test-Compat $best) { $cur = $best }
+        } elseif ($foreign.Count -gt 0) {
+            Write-Host ('The Node.js installed on this PC is too old for this installer (needs ' + $env:MIN_NODE + ' or newer).')
         }
+        if (-not $cur) { Write-Host ('Installing Node.js ' + $env:MIN_NODE + '+ into the shared Node folder.') }
+        Write-Host ''
         if (-not $cur) { $cur = Install-PrivateNode }
     }
 

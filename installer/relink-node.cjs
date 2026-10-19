@@ -1,8 +1,7 @@
 // Re-points Claude Desktop from replaced Node.js binaries to the current one.
 //
-// Run by installMAC.command / installWIN.cmd before they delete or leave a
-// Node.js (an older copy in the shared Node folder, or when moving to another
-// installed Node.js):
+// Run by installMAC.command / installWIN.cmd before they delete an older copy
+// in the shared Node folder:
 //   node installer/relink-node.cjs [--to=<new node>] <old node path> [...]
 //
 // What runs Node for Claude Desktop:
@@ -16,7 +15,13 @@
 // backed up before it is written.
 // Exit code: 0 done or nothing to do, 1 error (then nothing may be deleted).
 //
-// Kept IDENTICAL in MCP-Zotero and obsidian-local-rest-api (under installer/).
+// Shared file: identical copies ship with every installer that uses the
+// shared Node.js folder (each under installer/). Change it in one
+// repository, copy the change to every other copy, and run their tests.
+// Scope: only Claude Desktop (its config entries and node-wrapper.cmd files)
+// is re-pointed. Other installers or tools may run the same Node.js; anything
+// outside Claude Desktop that runs a replaced copy is not updated here and
+// must be re-pointed by its own installer.
 
 "use strict";
 

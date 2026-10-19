@@ -1,43 +1,54 @@
 #!/bin/bash
 
-# Double-click launcher for the Obsidian plugin installer (install.js) on macOS.
-# Keep it in the same folder as install.js.
+# Double-click launcher for this repository's installer (install.js) on macOS.
+# Keep it in the same folder as install.js. Arguments are passed on to
+# install.js (its header lists the options).
 #
-# Which Node.js is used (MIN_NODE differs: Zotero MCP 20, Obsidian plugin 22):
+# Which Node.js is used (MIN_NODE below is this installer's minimum, MAJOR or
+# MAJOR.MINOR; keep it in sync with "engines" in package.json):
+#   1. The shared Node folder ~/Library/Application Support/node has a copy
+#      that is new enough: it is used.
+#   2. The copy there is too old: the newest LTS is downloaded into the shared
+#      folder, Claude Desktop entries that run the old copy are re-pointed to
+#      it (installer/relink-node.cjs, config backed up), then the old copy is
+#      deleted. Nothing is deleted if re-pointing fails.
+#   3. No copy there yet: an installed Node.js (PATH, Homebrew, nvm,
+#      nodejs.org) is used if it passes the compatibility test (version >=
+#      MIN_NODE, its npm runs, this repo's installer tests installer/*.test.cjs
+#      pass with it). Otherwise the newest LTS is downloaded into the shared
+#      folder.
+# Downloads: only the build for this Mac's CPU; MCP_NODE_CHANNEL=current for
+# the newest "Current" release; SHA-256 verified before unpacking; no admin
+# rights, no shell profile changes; MCP_NO_NODE_DOWNLOAD=1 disables them.
+# Other Node.js installs are never changed.
 #
-# Fresh install (nothing in the shared Node folder
-#   ~/Library/Application Support/node
-# used by the Zotero MCP, Obsidian plugin and Obsidian bridge installers):
-#   An installed Node.js (PATH, Homebrew, nvm, nodejs.org) is used if it passes
-#   the compatibility test: version >= MIN_NODE, its npm runs, and this repo's
-#   installer tests (installer/*.test.cjs) pass with it. Otherwise the newest
-#   LTS is downloaded into the shared Node folder (only the build for this
-#   Mac's CPU; MCP_NODE_CHANNEL=current for the newest "Current" release;
-#   SHA-256 verified before unpacking; no admin rights, no shell profile
-#   changes; MCP_NO_NODE_DOWNLOAD=1 disables it).
+# Why these rules:
+# - Each run decides from what is there (the shared folder, installed Node.js)
+#   and this installer's MIN_NODE. No choice is remembered between runs, so
+#   installers with different minimums cannot undo each other's choice, and
+#   Claude Desktop needs none: its entries hold the Node.js path themselves.
+# - A shared copy that is too old is replaced, not swapped for an installed
+#   Node.js: the shared folder only changes when an installer changes it,
+#   while e.g. Homebrew keeps node under a versioned path
+#   (/opt/homebrew/Cellar/node/<version>/...) that goes away after an upgrade
+#   and leaves a Claude Desktop entry pointing at nothing.
 #
-# Re-run:
-#   The Node.js in use (the shared Node folder, or one chosen earlier — saved
-#   in its file "use-node"; delete that file to go back) stays, unless a NEWER
-#   installed Node.js passes the compatibility test. Then you are asked whether
-#   to move to it (Enter = yes) and, if so, whether to delete the copies in the
-#   shared Node folder (Enter = yes). Only too-old copies there: the same offer,
-#   otherwise the newest LTS is downloaded and the old copies are replaced.
-#
-# Claude Desktop entries that run a Node.js that is replaced or left are
-# re-pointed first (installer/relink-node.cjs, config backed up); nothing is
-# deleted if that fails. Other Node.js installs are never changed.
+# Shared launcher: the same file ships with every installer that uses the
+# shared Node folder; only MIN_NODE differs. Change it in one repository, then
+# copy the change to the others. Other installers or tools may run the same
+# Node.js: when a copy is replaced, installer/relink-node.cjs re-points the
+# Claude Desktop entries that use it; anything else that runs it is not
+# updated and must be re-pointed by its own installer.
 #
 # Then runs `node install.js` and keeps the window open so you can read it.
 #
 # If double-clicking is blocked by macOS, open Terminal, type `bash `, drag this
 # file into the window and press Enter.
 
-MIN_NODE=22
+MIN_NODE=22   # this installer's minimum (see "engines" in package.json)
 NODE_CHANNEL="${MCP_NODE_CHANNEL:-lts}"
 NODE_BASE_URL="https://nodejs.org/download/release"
 NODE_HOME_DIR="$HOME/Library/Application Support/node"
-CHOICE_FILE="$NODE_HOME_DIR/use-node"
 ORIG_PATH="$PATH"
 
 cd "$(dirname "$0")" || exit 1
@@ -56,22 +67,6 @@ pause_and_exit() {
   exit "$1"
 }
 
-# Enter = yes.
-ask_yes() {
-  local a
-  printf "%s [Y/n]: " "$1"
-  read -r a
-  case "$a" in [nN]*) return 1 ;; *) return 0 ;; esac
-}
-
-# Enter = no.
-ask_no() {
-  local a
-  printf "%s [y/N]: " "$1"
-  read -r a
-  case "$a" in [yYjJ]*) return 0 ;; *) return 1 ;; esac
-}
-
 node_arch() {
   case "$(uname -m)" in
     arm64)  echo "arm64" ;;
@@ -80,12 +75,24 @@ node_arch() {
   esac
 }
 
-# Compatibility test: true if `node` (default: the one on PATH) is at least MIN_NODE.
+# MIN_NODE split into major and minor (minor 0 if MIN_NODE is just MAJOR).
+MIN_MAJOR="${MIN_NODE%%.*}"
+MIN_MINOR=0
+case "$MIN_NODE" in *.*) MIN_MINOR="${MIN_NODE#*.}"; MIN_MINOR="${MIN_MINOR%%.*}" ;; esac
+
+# Compatibility test: true if `node` (default: the one on PATH) is at least
+# MIN_NODE (major and minor compared).
 node_ok() {
-  local major cmd="${1:-node}"
+  local v major minor cmd="${1:-node}"
   command -v "$cmd" >/dev/null 2>&1 || return 1
-  major="$("$cmd" -p 'process.versions.node.split(".")[0]' 2>/dev/null)" || return 1
-  [ -n "$major" ] && [ "$major" -ge "$MIN_NODE" ]
+  v="$("$cmd" -v 2>/dev/null)" || return 1
+  v="${v#v}"
+  major="${v%%.*}"
+  minor=0
+  case "$v" in *.*) minor="${v#*.}"; minor="${minor%%.*}" ;; esac
+  case "$major" in ''|*[!0-9]*) return 1 ;; esac
+  case "$minor" in ''|*[!0-9]*) minor=0 ;; esac
+  [ "$major" -gt "$MIN_MAJOR" ] || { [ "$major" -eq "$MIN_MAJOR" ] && [ "$minor" -ge "$MIN_MINOR" ]; }
 }
 
 use_node_dir() { # puts a node folder first on PATH
@@ -97,8 +104,6 @@ use_node_dir() { # puts a node folder first on PATH
 # The shared Node folder
 # ---------------------------------------------------------------------------
 
-PRIVATE_TOO_OLD=""
-
 # All copies in the shared Node folder (any version), one node binary per line.
 private_nodes() {
   local n
@@ -107,25 +112,19 @@ private_nodes() {
   done
 }
 
-# Newest copy for this CPU; used if it passes the compatibility test,
-# otherwise remembered in PRIVATE_TOO_OLD (update case).
-find_private_node() {
+# Newest copy for this CPU in the shared Node folder (its node binary), if any.
+newest_private_node() {
   local arch newest
   arch="$(node_arch)" || return 1
   [ -d "$NODE_HOME_DIR" ] || return 1
   newest="$(cd "$NODE_HOME_DIR" && ls -d node-v*-darwin-"$arch" 2>/dev/null \
     | sort -t. -k1.7,1n -k2,2n -k3,3n | tail -1)"
   [ -n "$newest" ] && [ -x "$NODE_HOME_DIR/$newest/bin/node" ] || return 1
-  if node_ok "$NODE_HOME_DIR/$newest/bin/node"; then
-    use_node_dir "$NODE_HOME_DIR/$newest/bin"
-    return 0
-  fi
-  PRIVATE_TOO_OLD="$("$NODE_HOME_DIR/$newest/bin/node" -v 2>/dev/null) at $NODE_HOME_DIR/$newest"
-  return 1
+  echo "$NODE_HOME_DIR/$newest/bin/node"
 }
 
 # ---------------------------------------------------------------------------
-# Other Node.js installs — only reported (and offered on a re-run), never changed
+# Other Node.js installs — used only if the shared folder is empty, never changed
 # ---------------------------------------------------------------------------
 
 FOREIGN_CMD=()
@@ -327,7 +326,7 @@ bootstrap_node() {
 }
 
 # ---------------------------------------------------------------------------
-# Replacing and moving (Claude Desktop entries are re-pointed first)
+# Replacing (Claude Desktop entries are re-pointed first)
 # ---------------------------------------------------------------------------
 
 # Major.minor.patch of a copy in the shared Node folder, e.g. 20.19.0.
@@ -339,8 +338,9 @@ version_lt() { # $1 < $2 ?  (X.Y.Z)
   [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)" = "$1" ]
 }
 
-# Update case: deletes copies in the shared Node folder that are older than
-# the one in use, without asking.
+# Deletes copies in the shared Node folder that are older than the one in
+# use, without asking — after re-pointing the Claude Desktop entries that run
+# them (rule 2; also cleans up leftovers).
 replace_older_private_nodes() {
   local current cur_ver n v olds=()
   current="$(node -p 'process.execPath')"
@@ -363,105 +363,56 @@ replace_older_private_nodes() {
   echo
 }
 
-# Moves to installed Node.js number $1 (already tested): asks (Enter = yes),
-# re-points Claude Desktop entries, saves the choice, then offers to delete
-# the copies in the shared Node folder (Enter = yes).
-offer_move_to_foreign() {
-  local i="$1" cmd="${FOREIGN_CMD[$1]}" ver="${FOREIGN_VER[$1]}" olds=() n
-  ask_yes "Newer Node.js $ver found at $cmd. Use it from now on?" || { echo; return 1; }
-
-  while IFS= read -r n; do [ -n "$n" ] && olds+=("$n"); done < <(private_nodes)
-  [ -n "$CURRENT" ] && [ "$CURRENT" != "${FOREIGN_REAL[$i]}" ] && olds+=("$CURRENT")
-  if ! "$cmd" installer/relink-node.cjs --to="$cmd" "${olds[@]}"; then
-    echo "Not moved: Claude Desktop entries could not be re-pointed."
-    echo
-    return 1
-  fi
-  mkdir -p "$NODE_HOME_DIR" && echo "$cmd" > "$CHOICE_FILE"
-  use_node_dir "$(dirname "$cmd")"
-  CURRENT="${FOREIGN_REAL[$i]}"
-  echo "Moved to $cmd (saved in $CHOICE_FILE; delete that file to go back)."
-
-  olds=()
-  while IFS= read -r n; do [ -n "$n" ] && olds+=("$n"); done < <(private_nodes)
-  if [ "${#olds[@]}" -gt 0 ] && ask_yes "Delete the Node.js copies in $NODE_HOME_DIR?"; then
-    for n in "${olds[@]}"; do rm -rf "${n%/bin/node}" && echo "Deleted ${n%/bin/node}"; done
-  fi
-  echo
-  return 0
-}
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+# Downloads the newest release into the shared Node folder, or stops.
+download_or_fail() {
+  if ! bootstrap_node || ! node_ok; then
+    echo
+    echo "Could not set up Node.js $MIN_NODE or newer automatically."
+    echo "Install it from https://nodejs.org and run this file again."
+    pause_and_exit 1
+  fi
+}
+
 collect_foreign_nodes
-CURRENT=""          # real path of the node binary in use
 BEST="$(best_foreign)"
 
-# 1) Re-run: a Node.js chosen earlier instead of the shared Node folder.
-if [ -f "$CHOICE_FILE" ]; then
-  chosen="$(head -n 1 "$CHOICE_FILE")"
-  if node_ok "$chosen"; then
-    use_node_dir "$(dirname "$chosen")"
-    CURRENT="$(node -p 'process.execPath')"
-    echo "Using the Node.js chosen earlier: $chosen ($(node -v))"
-    echo
-  else
-    echo "The Node.js chosen earlier ($chosen) is missing or too old for this installer;"
-    echo "back to the shared Node folder."
-    rm -f "$CHOICE_FILE"
-    echo
-  fi
-fi
+# Left by earlier versions of this launcher (a remembered choice); no longer used.
+rm -f "$NODE_HOME_DIR/use-node"
 
-# 2) Re-run: the shared Node folder.
-if [ -z "$CURRENT" ] && find_private_node; then
-  CURRENT="$(node -p 'process.execPath')"
-fi
-
-if [ -n "$CURRENT" ]; then
-  # Re-run: move to a newer installed Node.js if it passes the test.
-  if [ -n "$BEST" ] && [ "${FOREIGN_REAL[$BEST]}" != "$CURRENT" ] \
-     && version_lt "$(node -v | sed 's/^v//')" "${FOREIGN_VER[$BEST]#v}"; then
-    echo "Checking the newer Node.js installed on this Mac:"
-    compat_test "${FOREIGN_CMD[$BEST]}" "${FOREIGN_REAL[$BEST]}" && { echo; offer_move_to_foreign "$BEST"; } || echo
-  fi
+SHARED="$(newest_private_node)"
+if [ -n "$SHARED" ] && node_ok "$SHARED"; then
+  # Rule 1: the shared copy is new enough.
+  use_node_dir "$(dirname "$SHARED")"
+elif [ -n "$SHARED" ]; then
+  # Rule 2: the shared copy is too old -> download; replaced below.
+  echo "Node.js in the shared Node folder is too old for this installer (needs $MIN_NODE or newer):"
+  echo "  $("$SHARED" -v 2>/dev/null) at ${SHARED%/bin/node}"
+  echo "Updating to the newest Node.js; the old copy is replaced."
+  echo
+  download_or_fail
 else
-  if [ -n "$PRIVATE_TOO_OLD" ]; then
-    # Update case (re-run): our copy is too old.
-    echo "Node.js in the shared Node folder is too old for this installer (needs $MIN_NODE or newer):"
-    echo "  $PRIVATE_TOO_OLD"
-    echo
-    if [ -n "$BEST" ]; then
-      echo "Checking the Node.js installed on this Mac:"
-      compat_test "${FOREIGN_CMD[$BEST]}" "${FOREIGN_REAL[$BEST]}" && { echo; offer_move_to_foreign "$BEST"; } || echo
+  # Rule 3: nothing shared yet -> an installed Node.js that passes, else download.
+  echo "No Node.js in the shared Node folder yet."
+  USED_INSTALLED=""
+  if [ -n "$BEST" ]; then
+    echo "Checking the Node.js installed on this Mac:"
+    if compat_test "${FOREIGN_CMD[$BEST]}" "${FOREIGN_REAL[$BEST]}"; then
+      use_node_dir "$(dirname "${FOREIGN_CMD[$BEST]}")"
+      USED_INSTALLED=1
     fi
-    [ -z "$CURRENT" ] && { echo "Updating to the newest Node.js; the old copy is replaced."; echo; }
-  else
-    # Fresh install: use an installed Node.js if it passes the test.
-    echo "No Node.js in the shared Node folder yet."
-    if [ -n "$BEST" ]; then
-      echo "Checking the Node.js installed on this Mac:"
-      if compat_test "${FOREIGN_CMD[$BEST]}" "${FOREIGN_REAL[$BEST]}"; then
-        use_node_dir "$(dirname "${FOREIGN_CMD[$BEST]}")"
-        CURRENT="${FOREIGN_REAL[$BEST]}"
-      fi
-    elif [ "${#FOREIGN_CMD[@]}" -gt 0 ]; then
-      echo "The Node.js installed on this Mac is too old for this installer (needs $MIN_NODE or newer)."
-    fi
-    [ -z "$CURRENT" ] && echo "Installing Node.js $MIN_NODE+ into the shared Node folder."
-    echo
+  elif [ "${#FOREIGN_CMD[@]}" -gt 0 ]; then
+    echo "The Node.js installed on this Mac is too old for this installer (needs $MIN_NODE or newer)."
   fi
-
-  if [ -z "$CURRENT" ]; then
-    if ! bootstrap_node || ! node_ok; then
-      echo
-      echo "Could not set up Node.js $MIN_NODE or newer automatically."
-      echo "Install it from https://nodejs.org and run this file again."
-      pause_and_exit 1
-    fi
-    CURRENT="$(node -p 'process.execPath')"
+  if [ -z "$USED_INSTALLED" ]; then
+    echo "Installing Node.js $MIN_NODE+ into the shared Node folder."
+    echo
+    download_or_fail
+  else
+    echo
   fi
 fi
 

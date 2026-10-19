@@ -20,7 +20,8 @@
 // otherwise you pick from Obsidian's own list (Enter = most recently used).
 //
 // CommonJS like the rest of the repo; shared helpers are in
-// installer/install-lib.cjs (identical in MCP-Zotero and MCP-Bridge-Obsidian).
+// installer/install-lib.cjs (a shared file: identical copies ship with every
+// installer that uses the shared Node.js folder).
 
 "use strict";
 

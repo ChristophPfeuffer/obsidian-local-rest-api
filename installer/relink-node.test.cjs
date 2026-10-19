@@ -1,5 +1,5 @@
-// Tests for relink-node.cjs (kept IDENTICAL in MCP-Zotero and
-// obsidian-local-rest-api).
+// Tests for relink-node.cjs. Shared like relink-node.cjs itself: identical
+// copies ship with every installer that uses it.
 
 "use strict";
 

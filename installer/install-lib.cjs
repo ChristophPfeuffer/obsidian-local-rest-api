@@ -1,8 +1,7 @@
-// Shared installer helpers for the Zotero MCP, the Obsidian REST API plugin
-// and the Obsidian MCP bridge. This file is kept IDENTICAL in all three
-// repositories (MCP-Zotero, obsidian-local-rest-api, MCP-Bridge-Obsidian, each
-// under installer/) — change it in one, copy it to the others, and run all
-// three test suites.
+// Shared installer helpers.
+// Shared file: identical copies ship with every installer that uses the
+// shared Node.js folder (each under installer/). Change it in one
+// repository, copy the change to every other copy, and run their tests.
 //
 // Rules every installer built on this follows:
 //   - Install targets live in the per-user app-data folder, not in the repo:
@@ -16,8 +15,8 @@
 //   - Claude Desktop's config is backed up before every write.
 //   - Secrets (API keys) are masked in everything printed.
 //
-// CommonJS on purpose: the Obsidian repo is CommonJS and the Zotero repo is
-// ESM; a .cjs file can be required by the first and imported by the second.
+// CommonJS on purpose: a .cjs file can be required by CommonJS installers and
+// imported by ESM ones.
 
 "use strict";
 

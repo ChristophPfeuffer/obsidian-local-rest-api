@@ -5,11 +5,13 @@
 # Runs the PowerShell part of installWIN.cmd in a throw-away LOCALAPPDATA /
 # APPDATA with fake Node.js folders (an empty node.exe plus a VERSION file).
 # Test doubles replace: asking a node.exe for its version / npm / installer
-# tests, finding installed Node.js, the download, and the keyboard. Re-pointing
+# tests, finding installed Node.js, and the download. Re-pointing
 # Claude Desktop runs for real (installer\relink-node.cjs with your real node).
 # Nothing outside the temp folder is touched. Set VERBOSE=1 to see the output.
 #
-# Kept IDENTICAL in MCP-Zotero and obsidian-local-rest-api (under installer\).
+# Shared file: identical copies ship with every installer that uses the shared
+# Node.js folder (each under installer\). Change it in one repository, then
+# copy the change to every other copy.
 # ASCII only (Windows PowerShell 5.1 reads BOM-less scripts as ANSI).
 
 param([string]$Filter = '')
@@ -18,9 +20,16 @@ $ErrorActionPreference = 'Stop'
 $Repo = Split-Path -Parent $PSScriptRoot
 $LauncherText = [IO.File]::ReadAllText((Join-Path $Repo 'installWIN.cmd'))
 $PsCode = $LauncherText.Substring($LauncherText.IndexOf('#' + '#PS-BEGIN'))
-$Min = [int]([regex]::Match($LauncherText, '(?m)^set "MIN_NODE=(\d+)"').Groups[1].Value)
+# MIN_NODE in the launcher: MAJOR or MAJOR.MINOR (e.g. 20 or 22.13).
+$MinMatch = [regex]::Match($LauncherText, '(?m)^set "MIN_NODE=(\d+)(?:\.(\d+))?"')
+$MinRaw = $MinMatch.Value -replace '^set "MIN_NODE=|"$', ''
+$Min = [int]$MinMatch.Groups[1].Value                                    # major
+$Minor = 0
+if ($MinMatch.Groups[2].Success) { $Minor = [int]$MinMatch.Groups[2].Value }
 $OLD = '{0}.0.0' -f ($Min - 2)   # too old
-$OK  = '{0}.1.0' -f $Min         # new enough
+$OK  = '{0}.{1}.0' -f $Min, ($Minor + 1)   # new enough
+# Just below MIN_NODE: same major, one minor lower (or the major before).
+if ($Minor -gt 0) { $BELOW = '{0}.{1}.9' -f $Min, ($Minor - 1) } else { $BELOW = '{0}.99.0' -f ($Min - 1) }
 $NEW = '{0}.2.0' -f ($Min + 4)   # newer than OK
 $DL  = '99.0.0'                  # what the stubbed download "installs"
 
@@ -46,13 +55,6 @@ function Get-NodeVersion([string]$exe) {
 function Test-NodeNpm([string]$exe) { return -not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $exe) 'NONPM')) }
 function Invoke-InstallerTests([string]$exe) { return -not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $exe) 'FAILTESTS')) }
 function Get-ForeignCandidates { if ($env:ZM_TEST_FOREIGN) { return @($env:ZM_TEST_FOREIGN) }; return @() }
-$script:Answers = New-Object System.Collections.Queue
-foreach ($a in ("$env:ZM_TEST_ANSWERS" -split '\|')) { $script:Answers.Enqueue($a) }
-function Read-Answer([string]$prompt) {
-    Write-Host ($prompt + ': ')
-    if ($script:Answers.Count -gt 0) { return $script:Answers.Dequeue() }
-    return ''
-}
 function Invoke-Relink([string]$runExe, [string]$to, [string[]]$olds) {
     $ErrorActionPreference = 'Continue'
     & $env:ZM_TEST_REAL_NODE (Join-Path $Repo 'installer\relink-node.cjs') ('--to=' + $to) @olds | Out-Host
@@ -78,7 +80,7 @@ $Script = Join-Path $Root 'launcher.ps1'
 $PowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
 $SavedEnv = @{}
-foreach ($k in 'LOCALAPPDATA', 'APPDATA', 'MIN_NODE', 'ZM_REPO', 'ZM_RESULT', 'ZM_TEST_FOREIGN', 'ZM_TEST_ANSWERS', 'ZM_TEST_REAL_NODE') {
+foreach ($k in 'LOCALAPPDATA', 'APPDATA', 'MIN_NODE', 'ZM_REPO', 'ZM_RESULT', 'ZM_TEST_FOREIGN', 'ZM_TEST_REAL_NODE') {
     $SavedEnv[$k] = [Environment]::GetEnvironmentVariable($k)
 }
 
@@ -117,20 +119,20 @@ function Claude-Wrapper([string]$target) {
     $json = '{"mcpServers":{"zotero":{"command":' + (ConvertTo-Json $script:Wrapper) + '},"direct":{"command":' + (ConvertTo-Json $target) + '}}}'
     [IO.File]::WriteAllText($script:Cfg, $json)
 }
-function Choose([string]$exe) {
+function OldChoice([string]$exe) {
+    # use-node.txt as left by earlier versions of the launcher.
     New-Item -ItemType Directory -Force -Path $script:N | Out-Null
     [IO.File]::WriteAllText((Join-Path $script:N 'use-node.txt'), $exe)
 }
 
-# Runs the launcher's PowerShell part; $answers = typed answers, '|'-separated ('' = Enter).
-function Run([string]$answers = '') {
+# Runs the launcher's PowerShell part.
+function Run {
     $env:LOCALAPPDATA = Join-Path $script:T 'local'
     $env:APPDATA = Join-Path $script:T 'roaming'
-    $env:MIN_NODE = "$Min"
+    $env:MIN_NODE = $MinRaw
     $env:ZM_REPO = $Repo + '\'
     $env:ZM_RESULT = Join-Path $script:T 'result.txt'
     $env:ZM_TEST_FOREIGN = $script:Foreign
-    $env:ZM_TEST_ANSWERS = $answers
     $env:ZM_TEST_REAL_NODE = $RealNode
     $ErrorActionPreference = 'Continue'
     $script:Out = (& $PowerShell -NoProfile -ExecutionPolicy Bypass -File $Script 2>&1 | Out-String)
@@ -150,11 +152,8 @@ function Says([string]$text) { Check ($script:Out.Contains($text)) ('output shou
 function NotSays([string]$text) { Check (-not $script:Out.Contains($text)) ('output should not contain: ' + $text) }
 function HasPrivate([string]$v) { Check (Test-Path -LiteralPath (PrivExe $v)) ('shared folder should have v' + $v) }
 function NoPrivate([string]$v) { Check (-not (Test-Path -LiteralPath (PrivExe $v))) ('shared folder should not have v' + $v) }
-function ChoiceIs([string]$exe) {
-    $f = Join-Path $script:N 'use-node.txt'
-    $is = ''
-    if (Test-Path -LiteralPath $f) { $is = ([IO.File]::ReadAllText($f)).Trim() }
-    Check ($is -eq $exe) ("use-node.txt should be '" + $exe + "' (is '" + $is + "')")
+function NoChoice {
+    Check (-not (Test-Path -LiteralPath (Join-Path $script:N 'use-node.txt'))) "use-node.txt (earlier versions' remembered choice) should be gone"
 }
 function WrapperIs([string]$exe) {
     $text = [IO.File]::ReadAllText($script:Wrapper)
@@ -169,73 +168,67 @@ function Finish {
 }
 
 try {
-    # --- fresh install -------------------------------------------------------
-    if (Start-Case 'fresh: installed Node passes the test -> used') {
+    # --- rule 3: nothing in the shared folder yet ---------------------------
+    if (Start-Case 'rule 3: installed Node passes the test -> used, nothing downloaded') {
         ForeignNode $OK; Run
-        Uses $script:F; Says 'passed.'; NoPrivate $DL; ChoiceIs ''; Finish
+        Uses $script:F; Says 'passed.'; NoPrivate $DL; Finish
     }
-    if (Start-Case 'fresh: installed Node too old -> download') {
+    if (Start-Case 'rule 3: installed Node too old -> download') {
         ForeignNode $OLD; Run
         UsesPrivate $DL; Says 'too old for this installer'; Finish
     }
-    if (Start-Case 'fresh: installed Node fails the installer tests -> download') {
+    if (Start-Case 'rule 3: installed Node just below MIN_NODE -> download') {
+        ForeignNode $BELOW; Run
+        UsesPrivate $DL; Says 'too old for this installer'; Finish
+    }
+    if (Start-Case 'rule 3: installed Node fails the installer tests -> download') {
         ForeignNode $OK 'FAILTESTS'; Run
         UsesPrivate $DL; Says 'installer tests failed'; Finish
     }
-    if (Start-Case 'fresh: installed Node without npm -> download') {
+    if (Start-Case 'rule 3: installed Node without npm -> download') {
         ForeignNode $OK 'NONPM'; Run
         UsesPrivate $DL; Says 'npm does not run'; Finish
     }
-    if (Start-Case 'fresh: no Node at all -> download') {
+    if (Start-Case 'rule 3: no Node at all -> download') {
         Run
         UsesPrivate $DL; Says 'No Node.js in the shared Node folder yet.'; Finish
     }
 
-    # --- re-run --------------------------------------------------------------
-    if (Start-Case 're-run: our copy, installed Node older -> no question') {
-        PrivateNode $OK; ForeignNode ('{0}.0.1' -f $Min); Run
-        UsesPrivate $OK; NotSays 'Use it from now on?'; Says 'not used, left unchanged'; Finish
+    # --- rule 1: the shared copy is new enough ------------------------------
+    if (Start-Case 'rule 1: shared copy new enough -> used') {
+        PrivateNode $OK; Claude-Wrapper (PrivExe $OK); Run
+        UsesPrivate $OK; NoPrivate $DL; WrapperIs (PrivExe $OK); Finish
     }
-    if (Start-Case 're-run: newer installed Node, answer n -> stay') {
-        PrivateNode $OK; ForeignNode $NEW; Claude-Wrapper (PrivExe $OK); Run 'n'
-        UsesPrivate $OK; Says 'Use it from now on?'; HasPrivate $OK; ChoiceIs ''; WrapperIs (PrivExe $OK); Finish
+    if (Start-Case 'rule 1: newer installed Node -> shared copy still used, no question') {
+        PrivateNode $OK; ForeignNode $NEW; Run
+        UsesPrivate $OK; NotSays '[Y/n]'; Says 'not used, left unchanged'; Finish
     }
-    if (Start-Case 're-run: newer installed Node, Enter + Enter -> move, delete our copy') {
-        PrivateNode $OK; ForeignNode $NEW; Claude-Wrapper (PrivExe $OK); Run '|'
-        Uses $script:F; ChoiceIs $script:F; NoPrivate $OK; WrapperIs $script:F; DirectIs $script:F; Finish
+    if (Start-Case 'rule 1: older shared copies -> deleted, Claude re-pointed') {
+        PrivateNode $OLD; PrivateNode $OK; Claude-Wrapper (PrivExe $OLD); Run
+        UsesPrivate $OK; NoPrivate $OLD; HasPrivate $OK; WrapperIs (PrivExe $OK); DirectIs (PrivExe $OK); Finish
     }
-    if (Start-Case 're-run: newer installed Node, Enter + n -> move, keep our copy') {
-        PrivateNode $OK; ForeignNode $NEW; Run '|n'
-        Uses $script:F; ChoiceIs $script:F; HasPrivate $OK; Finish
-    }
-    if (Start-Case 're-run: newer installed Node fails the tests -> no question') {
-        PrivateNode $OK; ForeignNode $NEW 'FAILTESTS'; Run
-        UsesPrivate $OK; Says 'installer tests failed'; NotSays 'Use it from now on?'; Finish
-    }
-    if (Start-Case 're-run: saved choice still fine -> used') {
-        PrivateNode $OK; ForeignNode $NEW; Choose $script:F; Run
-        Uses $script:F; Says 'Using the Node.js chosen earlier'; Finish
-    }
-    if (Start-Case 're-run: saved choice now too old -> back to shared folder') {
-        PrivateNode $OK; ForeignNode $OLD; Choose $script:F; Run
-        UsesPrivate $OK; Says 'back to the shared Node folder'; ChoiceIs ''; Finish
+    if (Start-Case 'rule 1: use-node.txt left by an earlier launcher -> removed, ignored') {
+        PrivateNode $OK; ForeignNode $NEW; OldChoice $script:F; Run
+        UsesPrivate $OK; NoChoice; Finish
     }
 
-    # --- update case (our copy too old) --------------------------------------
-    if (Start-Case 'update: no usable installed Node -> download, old copy replaced, wrapper re-pointed') {
+    # --- rule 2: the shared copy is too old ---------------------------------
+    if (Start-Case 'rule 2: shared copy too old -> download, old copy replaced, wrapper re-pointed') {
         PrivateNode $OLD; Claude-Wrapper (PrivExe $OLD); Run
         UsesPrivate $DL; Says 'too old for this installer'; NoPrivate $OLD; HasPrivate $DL
         WrapperIs (PrivExe $DL); DirectIs (PrivExe $DL); Finish
     }
-    if (Start-Case 'update: installed Node passes, Enter + Enter -> move, old copy deleted') {
-        PrivateNode $OLD; ForeignNode $OK; Claude-Wrapper (PrivExe $OLD); Run '|'
-        Uses $script:F; ChoiceIs $script:F; NoPrivate $OLD; NoPrivate $DL; WrapperIs $script:F; Finish
+    if (Start-Case 'rule 2: shared copy just below MIN_NODE -> download, old copy replaced') {
+        PrivateNode $BELOW; Claude-Wrapper (PrivExe $BELOW); Run
+        UsesPrivate $DL; Says 'too old for this installer'; NoPrivate $BELOW; HasPrivate $DL
+        WrapperIs (PrivExe $DL); Finish
     }
-    if (Start-Case 'update: installed Node passes, answer n -> download instead') {
-        PrivateNode $OLD; ForeignNode $OK; Run 'n'
-        UsesPrivate $DL; ChoiceIs ''; NoPrivate $OLD; Finish
+    if (Start-Case 'rule 2: installed Node would pass -> still replaced by a download') {
+        PrivateNode $OLD; ForeignNode $OK; Claude-Wrapper (PrivExe $OLD); Run
+        UsesPrivate $DL; NoPrivate $OLD; HasPrivate $DL; NotSays 'Checking the Node.js installed'
+        WrapperIs (PrivExe $DL); Finish
     }
-    if (Start-Case 'update: Claude config unreadable -> old copy NOT deleted') {
+    if (Start-Case 'rule 2: Claude config unreadable -> old copy NOT deleted') {
         PrivateNode $OLD; [IO.File]::WriteAllText($script:Cfg, '{ broken'); Run
         UsesPrivate $DL; HasPrivate $OLD; Says 'could not be re-pointed'; Finish
     }
@@ -248,7 +241,7 @@ finally {
 if ($Filter -eq '--list') { exit 0 }
 if ($script:Ran -eq 0) { Write-Host ('No case matches "' + $Filter + '" (see --list).'); exit 1 }
 Write-Host ''
-Write-Host ('Launcher scenarios (MIN_NODE=' + $Min + ', real node ' + (& $RealNode -v) + '): ' + $script:Ran + ' cases, ' + $script:Pass + ' checks passed, ' + $script:Fail + ' failed.')
+Write-Host ('Launcher scenarios (MIN_NODE=' + $MinRaw + ', real node ' + (& $RealNode -v) + '): ' + $script:Ran + ' cases, ' + $script:Pass + ' checks passed, ' + $script:Fail + ' failed.')
 Write-Host '(VERBOSE=1 shows the launcher output of every case.)'
 if ($script:Fail -gt 0) { exit 1 }
 exit 0

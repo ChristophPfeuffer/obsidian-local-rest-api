@@ -1,5 +1,6 @@
-// Tests for install-lib.cjs. Kept IDENTICAL in all three repositories, like
-// the library itself. Run with:  node --test "installer/*.test.cjs"
+// Tests for install-lib.cjs. Shared like the library itself: identical copies
+// ship with every installer that uses it. Run with:
+//   node --test "installer/*.test.cjs"
 
 "use strict";
 
