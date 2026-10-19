@@ -67,6 +67,10 @@ function runChecks() {
     ["Build", ["run", "build"]],
   ]) {
     out.debug(`${label} …`);
+    if (/tests/i.test(label)) {
+      if (!lib.runTests(args, HERE, { label })) out.fail("Fix the failing tests first, then re-run. Nothing was installed.");
+      continue;
+    }
     if (lib.runNpm(args, HERE) !== 0) out.fail(`${label} failed — fix first, then re-run. Nothing was installed.`);
     out.ok(`${label} passed.`);
   }

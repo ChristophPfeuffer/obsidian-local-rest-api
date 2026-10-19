@@ -309,3 +309,66 @@ test("ensureNodeWrapper: unchanged wrapper -> no question; outdated -> asks; dec
   assert.equal(lib.readWrapperTarget(f), "C:\\b\\node.exe");
   assert.deepEqual(await lib.ensureNodeWrapper(noAsk, { platform: "darwin", execPath: "/n/node" }), { command: "/n/node", status: "not-needed" });
 });
+
+test("summarizeTestOutput: Node spec reporter — counts and only the failing-tests section", () => {
+  const out = [
+    "✔ a passes (1ms)",
+    "✔ b passes (1ms)",
+    "✖ c fails (2ms)",
+    "ℹ tests 3",
+    "ℹ suites 0",
+    "ℹ pass 2",
+    "ℹ fail 1",
+    "ℹ skipped 0",
+    "",
+    "✖ failing tests:",
+    "",
+    "test at x.js:1:1",
+    "✖ c fails (2ms)",
+    "  TypeError: boom",
+  ].join("\n");
+  const s = lib.summarizeTestOutput(out);
+  assert.deepEqual(s.counts, { tests: 3, passed: 2, failed: 1, skipped: 0 });
+  assert.match(s.failures, /c fails[\s\S]*TypeError: boom/);
+  assert.ok(!s.failures.includes("a passes"));
+});
+
+test("summarizeTestOutput: Node TAP reporter — failing blocks only", () => {
+  const out = ["ok 1 - a", "not ok 2 - b broke", "  ---", "  error: 'nope'", "  location: 'x.js:3:1'", "  ...", "ok 3 - c", "# tests 3", "# pass 2", "# fail 1", "# skipped 0"].join("\n");
+  const s = lib.summarizeTestOutput(out);
+  assert.deepEqual(s.counts, { tests: 3, passed: 2, failed: 1, skipped: 0 });
+  assert.match(s.failures, /not ok 2 - b broke\nerror: 'nope'/);
+  assert.ok(!s.failures.includes("ok 1"));
+});
+
+test("summarizeTestOutput: Jest — counts from the Tests: line, failures from the summary", () => {
+  const out = ["PASS src/a.test.ts", "FAIL src/b.test.ts", "Summary of all failing tests", "FAIL src/b.test.ts", "  ● b › breaks", "    expect(x).toBe(1)", "", "Test Suites: 1 failed, 1 passed, 2 total", "Tests:       1 failed, 4 skipped, 548 passed, 553 total"].join("\n");
+  const s = lib.summarizeTestOutput(out);
+  assert.deepEqual(s.counts, { tests: 553, passed: 548, failed: 1, skipped: 4 });
+  assert.match(s.failures, /● b › breaks/);
+  assert.ok(!s.failures.includes("PASS src/a.test.ts"));
+});
+
+test("runTests: one line on success, counts + failures only on failure", () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, "ok.test.cjs"), 'const t=require("node:test");t("one",()=>{});t("two",()=>{});');
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ scripts: { test: 'node --test "*.test.cjs"' } }));
+  const log = quietLog();
+  const printed = [];
+  const orig = console.log;
+  console.log = (m) => printed.push(String(m));
+  try {
+    assert.equal(lib.runTests(["test"], dir, { log }), true);
+    assert.deepEqual(log.lines, ["ok: Tests passed (2 tests)."]);
+    assert.equal(printed.length, 0);
+    fs.writeFileSync(path.join(dir, "bad.test.cjs"), 'const t=require("node:test");t("three fails",()=>{throw new Error("kaputt")});');
+    assert.equal(lib.runTests(["test"], dir, { log }), false);
+    assert.equal(log.lines[1], "warn: Tests failed (3 tests, 1 failed):");
+    const shown = printed.join("\n");
+    assert.match(shown, /three fails/);
+    assert.match(shown, /kaputt/);
+    assert.ok(!/\bone\b/.test(shown), "passing tests aren't listed");
+  } finally {
+    console.log = orig;
+  }
+});

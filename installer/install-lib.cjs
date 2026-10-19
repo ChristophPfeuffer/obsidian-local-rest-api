@@ -502,29 +502,108 @@ function npmInvocation(args, { platform = process.platform, execPath = process.e
   return { command: ["npm", ...args].join(" "), args: null, shell: true };
 }
 
-// Runs npm and returns its exit status. Quiet by default: npm's own output
-// (test lists, summaries, progress) is captured and only shown when the
-// command fails, so the installer shows just its own one-line results.
-function runNpm(args, cwd, { verbose = false, log = out, ...opts } = {}) {
+// Runs npm with its output captured. { status, output }.
+function captureNpm(args, cwd, opts = {}) {
   const inv = npmInvocation(args, opts);
   const spawnOpts = {
     cwd,
     shell: inv.shell,
-    stdio: verbose ? "inherit" : ["ignore", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
     env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
   };
+  // A test run started from inside another test run would otherwise report
+  // to the outer runner instead of printing its own summary.
+  delete spawnOpts.env.NODE_TEST_CONTEXT;
   const r = inv.args === null ? spawnSync(inv.command, spawnOpts) : spawnSync(inv.command, inv.args, spawnOpts);
   if (r.error) throw new Error(`Couldn't run npm (${r.error.message}).`);
-  if (r.status !== 0 && !verbose) {
-    const output = `${r.stdout || ""}${r.stderr || ""}`.trim();
-    if (output) {
-      log.warn(`Output of "npm ${args.join(" ")}":`);
-      console.log(output);
+  return { status: r.status, output: `${r.stdout || ""}${r.stderr || ""}` };
+}
+
+// Runs npm and returns its exit status. Quiet: npm's own output is only shown
+// when the command fails.
+function runNpm(args, cwd, { verbose = false, log = out, ...opts } = {}) {
+  if (verbose) {
+    const inv = npmInvocation(args, opts);
+    const spawnOpts = { cwd, shell: inv.shell, stdio: "inherit" };
+    const r = inv.args === null ? spawnSync(inv.command, spawnOpts) : spawnSync(inv.command, inv.args, spawnOpts);
+    if (r.error) throw new Error(`Couldn't run npm (${r.error.message}).`);
+    return r.status;
+  }
+  const { status, output } = captureNpm(args, cwd, opts);
+  if (status !== 0 && output.trim()) {
+    log.warn(`Output of "npm ${args.join(" ")}":`);
+    console.log(output.trim());
+  }
+  return status;
+}
+
+// Counts and failures from a test run's output — Node's test runner (spec or
+// TAP reporter) and Jest. { counts: {tests, passed, failed, skipped} | null,
+// failures: string | null }; null where the output didn't reveal it.
+function summarizeTestOutput(output) {
+  const text = String(output || "").replace(/\r\n/g, "\n");
+  const num = (re) => {
+    const all = [...text.matchAll(re)];
+    return all.length ? Number(all[all.length - 1][1]) : null;
+  };
+  let counts = null;
+  const nodeTests = num(/^(?:ℹ|#) tests (\d+)/gm);
+  if (nodeTests !== null) {
+    counts = { tests: nodeTests, passed: num(/^(?:ℹ|#) pass (\d+)/gm) ?? 0, failed: num(/^(?:ℹ|#) fail (\d+)/gm) ?? 0, skipped: num(/^(?:ℹ|#) skipped (\d+)/gm) ?? 0 };
+  } else {
+    const jest = [...text.matchAll(/^Tests:\s+(.*)$/gm)].pop();
+    if (jest) {
+      const part = (w) => Number((jest[1].match(new RegExp(`(\\d+) ${w}`)) || [0, 0])[1]);
+      counts = { tests: part("total"), passed: part("passed"), failed: part("failed"), skipped: part("skipped") + part("todo") };
     }
   }
-  return r.status;
+
+  let failures = null;
+  const spec = text.indexOf("✖ failing tests:");
+  if (spec >= 0) {
+    failures = text.slice(spec + "✖ failing tests:".length).split(/\n(?:ℹ|#) tests \d+/)[0].trim();
+  } else if (/^\s*not ok \d+/m.test(text)) {
+    // TAP: each failing test's block, up to its closing "..."
+    const blocks = [];
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^(\s*)not ok \d+ - (.*)$/);
+      if (!m) continue;
+      const block = [lines[i].trim()];
+      for (let j = i + 1; j < lines.length; j++) {
+        if (/^\s*\.\.\.\s*$/.test(lines[j])) break;
+        if (/^\s*(?:not )?ok \d+/.test(lines[j])) break;
+        if (/^\s*(error|expected|actual|location|stack|code|name|failureType):/.test(lines[j]) || /^\s{4,}\S/.test(lines[j])) block.push(lines[j].replace(/^\s{2}/, ""));
+      }
+      blocks.push(block.slice(0, 25).join("\n"));
+    }
+    failures = blocks.join("\n\n");
+  } else {
+    const jest = text.indexOf("Summary of all failing tests");
+    if (jest >= 0) failures = text.slice(jest).split(/\nTest Suites:/)[0].trim();
+    else if (/^\s*●/m.test(text)) failures = text.slice(text.search(/^\s*●/m)).split(/\nTest Suites:/)[0].trim();
+  }
+  return { counts, failures: failures || null };
+}
+
+// Runs `npm <args>` as a test step. Success: one line with the count. Failure:
+// the counts and only the failing tests (the whole output if it can't be
+// parsed). Returns true when the tests passed.
+function runTests(args, cwd, { label = "Tests", log = out, ...opts } = {}) {
+  const { status, output } = captureNpm(args, cwd, opts);
+  const { counts, failures } = summarizeTestOutput(output);
+  const countText = counts
+    ? `${counts.tests} tests${counts.failed ? `, ${counts.failed} failed` : ""}${counts.skipped ? `, ${counts.skipped} skipped` : ""}`
+    : null;
+  if (status === 0) {
+    log.ok(`${label} passed${countText ? ` (${countText})` : ""}.`);
+    return true;
+  }
+  log.warn(`${label} failed${countText ? ` (${countText})` : ""}:`);
+  console.log((failures || output).trim());
+  return false;
 }
 
 module.exports = {
@@ -558,5 +637,8 @@ module.exports = {
   parseVaultList,
   chooseVault,
   npmInvocation,
+  captureNpm,
   runNpm,
+  summarizeTestOutput,
+  runTests,
 };
