@@ -373,3 +373,53 @@ test("runTests: one line on success, counts + failures only on failure", () => {
     console.log = orig;
   }
 });
+
+function configFile(dir, name, servers) {
+  const p = path.join(dir, name);
+  fs.writeFileSync(p, JSON.stringify({ mcpServers: servers }));
+  return p;
+}
+
+test("chooseConfigPath: one file -> that one, printed, no question; none -> resolveConfigPath's choice", async () => {
+  const dir = tmpDir();
+  const a = configFile(dir, "a.json", {});
+  const noAsk = { ask: async () => assert.fail("must not ask") };
+  const log = quietLog();
+  const r = await lib.chooseConfigPath(noAsk, { serverName: "zotero", candidates: [{ path: a, tag: "standard" }, { path: path.join(dir, "missing.json"), tag: "store" }], log });
+  assert.deepEqual(r, { path: a, others: [] });
+  assert.ok(log.lines.some((l) => l === `ok: Claude Desktop config: ${a}`), "the chosen file is always printed");
+  const none = await lib.chooseConfigPath(noAsk, { serverName: "zotero", candidates: [{ path: path.join(dir, "x.json"), tag: "standard" }, { path: path.join(dir, "y.json"), tag: "store" }], log: quietLog() });
+  assert.equal(none.path, path.join(dir, "y.json"));
+});
+
+test("chooseConfigPath: several files -> the one with the server's entry, without asking", async () => {
+  const dir = tmpDir();
+  const std = configFile(dir, "std.json", { other: {} });
+  const store = configFile(dir, "store.json", { zotero: { command: "n" } });
+  const noAsk = { ask: async () => assert.fail("must not ask") };
+  const r = await lib.chooseConfigPath(noAsk, { serverName: "zotero", candidates: [{ path: std, tag: "standard" }, { path: store, tag: "store" }], log: quietLog() });
+  assert.deepEqual(r, { path: store, others: [std] });
+});
+
+test("chooseConfigPath: several files, none (or several) with the entry -> listed newest first; Enter = newest, a number picks", async () => {
+  const dir = tmpDir();
+  const old = configFile(dir, "old.json", {});
+  const neu = configFile(dir, "new.json", {});
+  const times = { [old]: 1000, [neu]: 2000 };
+  const candidates = [{ path: old, tag: "standard" }, { path: neu, tag: "store" }];
+  const answers = ["", "2", "7"];
+  const p = { ask: async () => answers.shift() };
+  const opts = { serverName: "zotero", candidates, mtime: (f) => times[f], log: quietLog(), print: () => {} };
+  assert.equal((await lib.chooseConfigPath(p, opts)).path, neu);
+  assert.equal((await lib.chooseConfigPath(p, opts)).path, old);
+  await assert.rejects(() => lib.chooseConfigPath(p, opts), /not one of 1–2/);
+});
+
+test("secretFromConfigs: the server's key from another config file; null if none has one", () => {
+  const dir = tmpDir();
+  const a = configFile(dir, "a.json", { zotero: { env: { ZOTERO_LOCAL: "false" } } });
+  const b = configFile(dir, "b.json", { zotero: { env: { ZOTERO_API_KEY: " k123 " } } });
+  assert.deepEqual(lib.secretFromConfigs([a, b], "zotero", "ZOTERO_API_KEY"), { value: "k123", path: b });
+  assert.equal(lib.secretFromConfigs([a, path.join(dir, "none.json")], "zotero", "ZOTERO_API_KEY"), null);
+  assert.equal(lib.secretFromConfigs(undefined, "zotero", "ZOTERO_API_KEY"), null);
+});

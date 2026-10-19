@@ -157,6 +157,58 @@ function resolveConfigPath(candidates, exists = fs.existsSync) {
   return candidates.find((c) => exists(c.path)) || candidates.find((c) => c.tag === "store") || candidates[0];
 }
 
+// Which Claude Desktop config to use — always printed, never silent. With
+// one existing file (or none yet) that one / resolveConfigPath's choice.
+// With several (e.g. a standard and a Store install side by side): the one
+// that already holds this server's entry; if that doesn't decide, the files
+// are listed (newest first) and the user picks one. Returns
+// { path, others } — others: the other existing config files.
+async function chooseConfigPath(prompter, { serverName, candidates = candidateConfigPaths(), exists = fs.existsSync, read = readClaudeConfig, mtime = (p) => fs.statSync(p).mtimeMs, log = out, print = console.log } = {}) {
+  const present = candidates.filter((c) => exists(c.path));
+  let chosen;
+  if (present.length <= 1) {
+    chosen = present[0] || resolveConfigPath(candidates, exists);
+  } else {
+    const hasEntry = (c) => {
+      try {
+        return Boolean(read(c.path).mcpServers[serverName]);
+      } catch {
+        return false;
+      }
+    };
+    const withEntry = present.filter(hasEntry);
+    if (withEntry.length === 1) {
+      chosen = withEntry[0];
+      log.debug(`${present.length} Claude Desktop config files exist — using the one with the "${serverName}" entry.`);
+    } else {
+      const sorted = [...present].sort((a, b) => mtime(b.path) - mtime(a.path));
+      print(`\n  ${present.length} Claude Desktop config files exist (${withEntry.length ? `several have "${serverName}"` : `none has "${serverName}" yet`}):`);
+      sorted.forEach((c, i) => print(`    ${i + 1}) ${c.path}  [${c.tag}, last changed ${new Date(mtime(c.path)).toLocaleString()}]`));
+      const answer = (await prompter.ask("Which one does Claude Desktop use? Number [1]: ")).trim();
+      const n = answer === "" ? 1 : Number(answer);
+      if (!Number.isInteger(n) || n < 1 || n > sorted.length) throw new Error(`'${answer}' is not one of 1–${sorted.length} — nothing was changed, re-run the installer.`);
+      chosen = sorted[n - 1];
+    }
+  }
+  log.ok(`Claude Desktop config: ${chosen.path}`);
+  return { path: chosen.path, others: present.filter((c) => c.path !== chosen.path).map((c) => c.path) };
+}
+
+// A secret (e.g. ZOTERO_API_KEY) that this server's entry holds in one of
+// the given config files: { value, path } of the first one found, or null.
+function secretFromConfigs(paths, serverName, keyName, read = readClaudeConfig) {
+  for (const p of paths || []) {
+    try {
+      const entry = read(p).mcpServers[serverName];
+      const value = entry && entry.env && entry.env[keyName];
+      if (typeof value === "string" && value.trim()) return { value: value.trim(), path: p };
+    } catch {
+      // unreadable config — not a source for a key
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Compare-before-write
 // ---------------------------------------------------------------------------
@@ -615,6 +667,8 @@ module.exports = {
   defaultTarget,
   candidateConfigPaths,
   resolveConfigPath,
+  chooseConfigPath,
+  secretFromConfigs,
   deepEqual,
   writeIfChanged,
   copyIfChanged,
